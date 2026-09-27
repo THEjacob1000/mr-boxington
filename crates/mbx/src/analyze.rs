@@ -21,8 +21,8 @@ mod critical_path;
 use crate::config::Config;
 use crate::events::{ActionOutcome, SessionEvent};
 use crate::explain::{
-    Baselines, RecordedSession, changed_keys, dependencies_behind, guidance, is_truncated,
-    join_names, previous_recording,
+    Baselines, RecordedSession, changed_keys, dependencies_behind, dependency_name, guidance,
+    is_truncated, join_names, previous_recording,
 };
 use crate::util::format_duration;
 use critical_path::CriticalPath;
@@ -60,6 +60,9 @@ pub(crate) enum Cause {
     Settings(Setting),
     /// The key was seen before, but its result was not available.
     Unavailable,
+    /// The key was seen before, but this build had no prediction naming it,
+    /// so it never looked the key up.
+    Unpredicted,
     /// Nothing earlier was recorded to compare this miss against.
     NoHistory,
     /// The store had no key to look up; the result was stored for next time.
@@ -160,13 +163,15 @@ impl Analysis {
                 // settings. Its key can still be compared with an earlier
                 // recording of the same unit, and that says what was new.
                 ActionOutcome::Unconsulted => {
-                    match previous_recording(baselines, &name, diagnostic.as_ref()) {
-                        Some(previous)
-                            if diagnostic
-                                .as_ref()
-                                .is_some_and(|current| current.action != previous.action) =>
-                        {
-                            classify_miss(&name, diagnostic.as_ref(), Some(previous))
+                    match (
+                        diagnostic.as_ref(),
+                        previous_recording(baselines, &name, diagnostic.as_ref()),
+                    ) {
+                        (Some(current), Some(previous)) if current.action == previous.action => {
+                            Own::Cause(Cause::Unpredicted, Vec::new())
+                        }
+                        (Some(current), Some(previous)) => {
+                            classify_miss(&name, Some(current), Some(previous))
                         }
                         _ => Own::Cause(Cause::FirstBuild, Vec::new()),
                     }
@@ -197,7 +202,9 @@ impl Analysis {
         let mut uncached_ns = 0u64;
         let mut uncached_count = 0u64;
         for (name, duration_ns, own) in &records {
-            if !matches!(own, Own::Cause(cause, _) if is_expected(cause)) {
+            // Work with nothing to cache still counts once it took compiler
+            // time; Cargo's probes record none, and are not work.
+            if *duration_ns > 0 || !matches!(own, Own::Cause(cause, _) if is_expected(cause)) {
                 uncached_ns = uncached_ns.saturating_add(*duration_ns);
                 uncached_count += 1;
             }
@@ -292,7 +299,7 @@ impl Analysis {
                 })
                 .then_with(|| left_cause.cmp(right_cause))
         });
-        if ranked.is_empty() && self.hits == 0 {
+        if ranked.is_empty() && self.hits == 0 && self.uncached_count == 0 {
             let _ = writeln!(
                 out,
                 "\nnothing was compiled or restored; Cargo found every unit up to date"
@@ -462,19 +469,25 @@ fn classify_miss(
     }
     let components = changed_keys(&previous.components, &current.components);
     let inputs = changed_keys(&previous.inputs, &current.inputs);
-    let dependencies = dependencies_behind(&inputs);
     // Cargo derives a unit's metadata hash, its file names, and its `--extern`
     // paths from its dependencies' hashes, so a dependency that changed moves
-    // those arguments too. They are the consequence here, not the cause.
-    if !dependencies.is_empty() && components.iter().all(|name| follows_dependencies(name)) {
-        return Own::Dependencies(dependencies);
-    }
-    if !components.is_empty() {
-        let (setting, details) = setting(&components);
+    // those arguments too. They are consequences, never the cause.
+    let settings: Vec<_> = components
+        .into_iter()
+        .filter(|name| !follows_dependencies(name))
+        .collect();
+    if !settings.is_empty() {
+        let (setting, details) = setting(&settings);
         return Own::Cause(Cause::Settings(setting), details);
     }
-    if !inputs.is_empty() {
+    // A crate whose own sources changed is where its change started, even
+    // when a dependency changed in the same build.
+    if inputs.iter().any(|path| dependency_name(path).is_none()) {
         return Own::Cause(Cause::Changed(name.to_string()), Vec::new());
+    }
+    let dependencies = dependencies_behind(&inputs);
+    if !dependencies.is_empty() {
+        return Own::Dependencies(dependencies);
     }
     Own::Cause(Cause::Settings(Setting::Other), Vec::new())
 }
@@ -546,9 +559,13 @@ fn collect_roots<'a>(
     roots: &mut BTreeSet<&'a str>,
 ) {
     match verdicts.get(name) {
-        Some(Own::Dependencies(dependencies)) if seen.insert(name) => {
-            for dependency in dependencies {
-                collect_roots(dependency, verdicts, seen, roots);
+        // A crate reached twice, as in a diamond, was already followed; it
+        // is a path to the root, never a root of its own.
+        Some(Own::Dependencies(dependencies)) => {
+            if seen.insert(name) {
+                for dependency in dependencies {
+                    collect_roots(dependency, verdicts, seen, roots);
+                }
             }
         }
         _ => {
@@ -582,6 +599,7 @@ fn title(cause: &Cause) -> String {
         Cause::Settings(Setting::Linker) => "the linker changed".into(),
         Cause::Settings(Setting::Other) => "other key details changed".into(),
         Cause::Unavailable => "results missing for keys built before".into(),
+        Cause::Unpredicted => "keys built before, but not looked up".into(),
         Cause::NoHistory => "misses with no earlier recording".into(),
         Cause::FirstBuild => "first build of these compilations".into(),
         Cause::Bypass(reason) => format!("not cacheable: {reason}"),
@@ -607,7 +625,8 @@ fn advice(cause: &Cause, group: &Group, baseline_truncated: bool) -> Option<Stri
         Cause::Unavailable => "These keys were built before, but their results were no longer in the store or on the remote. `mbx gc --dry-run` shows what the store budget keeps.".into(),
         Cause::NoHistory if baseline_truncated => "An earlier build stopped recording at the per-session size limit, so its details for these crates may be among the rows it dropped.".into(),
         Cause::NoHistory => "No earlier build recorded key details for these crates. The store may be new, its history may have expired, or they were built by another adapter.".into(),
-        Cause::FirstBuild => "Nothing recorded an earlier build of these crates to compare with, and there was no key to look up. The results were stored, so the next build with the same inputs restores them.".into(),
+        Cause::Unpredicted => "An earlier build produced these exact keys, but this build had no prediction naming them, so it did not look them up. The predictions this build recorded let the next run of the same command find them, except for crates mbx is keeping private incremental state for while you edit them.".into(),
+        Cause::FirstBuild => "Nothing recorded an earlier build of these crates to compare with, and there was no key to look up. The next build with the same inputs restores them, except for crates mbx is keeping private incremental state for while you edit them.".into(),
         Cause::Bypass(reason) => guidance(reason).into(),
     };
     Some(advice)

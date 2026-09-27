@@ -363,7 +363,7 @@ pub(crate) fn dependencies_behind(inputs: &[String]) -> Vec<String> {
 /// platform's dynamic library extension), which is enough to recover the crate
 /// without consulting the dependency graph. Anything else is a source file, and
 /// is left to speak for itself.
-fn dependency_name(path: &str) -> Option<String> {
+pub(crate) fn dependency_name(path: &str) -> Option<String> {
     let file = path.rsplit(['/', '\\']).next()?;
     let (stem, extension) = file.rsplit_once('.')?;
     if !matches!(extension, "rmeta" | "rlib" | "so" | "dylib" | "dll") {

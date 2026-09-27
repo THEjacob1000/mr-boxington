@@ -44,15 +44,16 @@ dependents appears as one cause.
 
 | Cause | Meaning |
 | --- | --- |
-| `inputs of <crate> changed` | The crate's sources changed, or a dependency that did not recompile in this build |
+| `inputs of <crate> changed` | The crate's sources changed, or a dependency that did not recompile in this build; a crate edited in the same build as its dependency counts here too |
 | `compiler arguments changed` | Different flags, profile, or features than the last recording; a `changed:` line counts each flag |
 | `environment changed` | A variable that is part of the key had a different value; the `changed:` line names it |
 | `the Rust toolchain changed` | Every key includes the compiler, so each crate rebuilds once |
 | `the mbx key format changed` | A new mbx version computes keys differently |
 | `the linker changed` | A native link's key names its linker |
 | `results missing for keys built before` | The key matched an earlier recording, but its result had been evicted or was absent from the remote |
+| `keys built before, but not looked up` | An earlier build produced the same key, but this build had no prediction naming it |
 | `misses with no earlier recording` | Nothing recorded explains the miss; the store may be new or its history expired |
-| `first build of these compilations` | No earlier recording and no key to look up; the result was stored for the next build |
+| `first build of these compilations` | No earlier recording and no key to look up |
 | `not cacheable: <reason>` | mbx bypassed the compilation; see [caching limits](/limits) |
 
 Cargo moves a crate's metadata hash, output file names, and `--extern` paths
@@ -60,7 +61,12 @@ whenever a dependency changes. Those arguments are treated as consequences of
 the dependency change and never listed as the flag that changed.
 
 Compilations with nothing to cache, such as Cargo's compiler queries, are
-listed on one final line and not counted as uncached work.
+listed on one final line. They count as uncached work only when they took
+compiler time.
+
+A crate you are editing keeps private [incremental state](/incremental)
+instead of publishing its result, so a later build does not restore it from
+the cache even when the report names it as a first build.
 
 ## What it compares against
 
