@@ -555,3 +555,26 @@ fn a_verification_counts_as_restored_work() {
     assert!(!text.contains("nothing was restored"), "{text}");
     assert!(text.contains("every compilation that could be cached was restored"));
 }
+
+/// A rebuild that did not match its cached result is a cache-integrity
+/// warning, never a quiet success.
+#[test]
+fn a_divergent_verification_is_reported() {
+    let text = analyze(
+        Vec::new(),
+        vec![
+            action(ActionOutcome::Verification { matched: true }, "a", 1, None),
+            action(ActionOutcome::Verification { matched: false }, "b", 1, None),
+        ],
+    )
+    .text();
+
+    assert!(
+        text.contains("; 2 hits rebuilt to verify, 1 diverged\n"),
+        "{text}"
+    );
+    assert!(
+        text.contains("warning: 1 verified hit rebuilt differently from its cached result"),
+        "{text}"
+    );
+}

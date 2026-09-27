@@ -121,6 +121,8 @@ pub(crate) struct Analysis {
     hits: u64,
     /// Hits rebuilt to check them; restored, but not counted as hits.
     verifications: u64,
+    /// Verifications whose rebuild did not match the cached result.
+    divergences: u64,
     avoided_ns: u64,
     uncached_count: u64,
     uncached_ns: u64,
@@ -134,6 +136,7 @@ impl Analysis {
     pub(crate) fn of(session: &RecordedSession, baselines: &Baselines) -> Self {
         let mut hits = 0;
         let mut verifications = 0;
+        let mut divergences = 0;
         let mut avoided_ns = 0u64;
         // Each uncached compilation with its crate, time, and own verdict.
         let mut records = Vec::new();
@@ -160,8 +163,11 @@ impl Analysis {
                 }
                 // A verification rebuilds a hit on purpose; it is not a
                 // cache loss.
-                ActionOutcome::Verification { .. } => {
+                ActionOutcome::Verification { matched } => {
                     verifications += 1;
+                    if !matched {
+                        divergences += 1;
+                    }
                     continue;
                 }
                 // No prediction named a key to look up, which is what happens
@@ -253,6 +259,7 @@ impl Analysis {
             },
             hits,
             verifications,
+            divergences,
             avoided_ns,
             uncached_count,
             uncached_ns,
@@ -290,6 +297,9 @@ impl Analysis {
                 self.verifications,
                 plural(self.verifications, "hit", "hits"),
             );
+            if self.divergences > 0 {
+                let _ = write!(out, ", {} diverged", self.divergences);
+            }
         }
         out.push('\n');
         if self.truncated {
@@ -314,6 +324,15 @@ impl Analysis {
                 })
                 .then_with(|| left_cause.cmp(right_cause))
         });
+        if self.divergences > 0 {
+            let _ = writeln!(
+                out,
+                "\nwarning: {} verified {} rebuilt differently from {} cached result; the build's own warnings name each mismatch",
+                self.divergences,
+                plural(self.divergences, "hit", "hits"),
+                plural(self.divergences, "its", "their"),
+            );
+        }
         let restored = self.hits + self.verifications;
         if ranked.is_empty() && restored == 0 && self.uncached_count == 0 {
             let _ = writeln!(
