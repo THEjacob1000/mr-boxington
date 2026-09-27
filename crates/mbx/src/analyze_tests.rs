@@ -544,7 +544,8 @@ fn a_divergent_verification_is_reported() {
         "{text}"
     );
     assert!(
-        text.contains("warning: 1 verified hit rebuilt differently from its cached result"),
+        text.contains("warning: 1 verified hit did not match its cached result: the rebuild failed or produced different output"),
         "{text}"
     );
+    assert!(text.contains("MBX_VERIFY=1"), "{text}");
 }
