@@ -1385,6 +1385,26 @@ fn finds_crate_names_in_transparent_invocations() {
     assert_eq!(crate_name_argument(&["--version".into()]), None);
 }
 
+/// Cargo can move a compilation's arguments into an `@argfile`. The crate
+/// name, and so the unit's label and whether it is a probe, are inside it.
+#[test]
+fn finds_crate_names_inside_argfiles() {
+    let directory = tempfile::tempdir().unwrap();
+    let argfile = directory.path().join("args");
+    std::fs::write(
+        &argfile,
+        "--crate-name\nfixture\n--crate-type\nlib\nsrc/lib.rs\n",
+    )
+    .unwrap();
+    let mut given = std::ffi::OsString::from("@");
+    given.push(&argfile);
+    let arguments = vec![given];
+
+    assert_eq!(crate_name_argument(&arguments), None);
+    let described = mbx_cache_rustc::RustcInvocation::expand_arguments(&arguments).unwrap();
+    assert_eq!(crate_name_argument(&described), Some("fixture".into()));
+}
+
 #[test]
 fn recognizes_the_bypassed_invocations_that_run_a_linker() {
     // Native links bypass the cache today, so this is the only thing that

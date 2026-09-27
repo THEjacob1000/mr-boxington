@@ -1556,17 +1556,16 @@ pub fn run_rustc_shim() -> ExitCode {
         .is_some_and(|wrapper| wrapper == rustc);
     let (wrapper_argument, compiler_arguments) = workspace_wrapper_arguments(&rustc, &arguments);
     let cacheable_workspace_wrapper = is_workspace_wrapper && wrapper_argument.is_some();
+    // Cargo moves long argument lists into `@argfile`s; the flags that name
+    // and describe the compilation are inside them then. rustc still receives
+    // the arguments as they were given.
+    let described = mbx_cache_rustc::RustcInvocation::expand_arguments(&arguments)
+        .unwrap_or_else(|_| arguments.clone());
     // Held here rather than inside the cache attempt so that a compilation
     // that bypasses is timed through its compiler run as well.
-    let _timing = crate::phase_timing::start("rustc", crate_name_argument(&arguments));
+    let _timing = crate::phase_timing::start("rustc", crate_name_argument(&described));
     let out_dir = std::env::var_os("OUT_DIR").map(PathBuf::from);
-    // Cargo moves long argument lists into `@argfile`s; the flags naming the
-    // unit are inside them then.
-    let expanded = mbx_cache_rustc::RustcInvocation::expand_arguments(&arguments);
-    let (unit_id, dependencies) = crate::unit_graph::rustc_unit(
-        expanded.as_deref().unwrap_or(&arguments),
-        out_dir.as_deref(),
-    );
+    let (unit_id, dependencies) = crate::unit_graph::rustc_unit(&described, out_dir.as_deref());
     crate::phase_timing::identify(unit_id, dependencies);
     if std::env::var_os(PREVIOUS_RUSTC_WRAPPER_ENV).is_none()
         && (!is_workspace_wrapper || cacheable_workspace_wrapper)
@@ -1584,7 +1583,7 @@ pub fn run_rustc_shim() -> ExitCode {
         }
     }
 
-    run_transparent_rustc(rustc, arguments)
+    run_transparent_rustc(rustc, arguments, &described)
 }
 
 /// Explicit Cargo targets must not affect host build scripts or proc macros.
@@ -1643,18 +1642,25 @@ fn executable_stem(executable: &OsStr) -> Option<&str> {
     Path::new(executable).file_stem()?.to_str()
 }
 
-fn run_transparent_rustc(rustc: OsString, arguments: Vec<OsString>) -> ExitCode {
+/// Run the compiler without caching. `described` is `arguments` with any
+/// `@argfile` expanded, which is where to look for what is being compiled;
+/// rustc itself is given `arguments` unchanged.
+fn run_transparent_rustc(
+    rustc: OsString,
+    arguments: Vec<OsString>,
+    described: &[OsString],
+) -> ExitCode {
     // The compiler below may replace this process, and with it any lease on
     // a stable `OUT_DIR`; it compiles against Cargo's own tree instead.
     crate::out_dir::restore();
-    let crate_name = crate_name_argument(&arguments);
+    let crate_name = crate_name_argument(described);
     // A bypassed compilation is still a real compiler process the machine has
     // to pay for. Probe invocations pass through unscheduled: cargo runs them
     // to learn about the compiler before it plans anything, so making one wait
     // for a permit would stall a build's startup behind its siblings' permits.
     // Most probes carry no --crate-name; the target-info queries carry the
     // placeholder name `___` alongside `--print`, and compile nothing.
-    let is_query = arguments.iter().any(|argument| {
+    let is_query = described.iter().any(|argument| {
         argument == "-"
             || argument
                 .to_str()
@@ -1663,7 +1669,7 @@ fn run_transparent_rustc(rustc: OsString, arguments: Vec<OsString>) -> ExitCode 
     let demand = crate_name
         .as_deref()
         .filter(|_| !is_query)
-        .map(|name| crate::scheduler::Demand::new(name, links_natively(&arguments)));
+        .map(|name| crate::scheduler::Demand::new(name, links_natively(described)));
     let permit = demand
         .as_ref()
         .and_then(|demand| crate::scheduler::pool().and_then(|pool| pool.admit(demand)));
