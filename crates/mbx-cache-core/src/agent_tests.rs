@@ -644,6 +644,112 @@ async fn reports_each_accounted_decision_to_an_observer() {
     ));
 }
 
+/// A bypass reason and the compiler run it caused arrive as one event, so the
+/// reason is recorded with the crate and the time it cost. A reason sent without
+/// a compile is still reported, once its connection ends.
+#[tokio::test]
+async fn a_bypass_reported_with_its_compile_names_the_crate_and_time() {
+    let directory = tempfile::tempdir().unwrap();
+    let observer = Arc::new(RecordingObserver::default());
+    let agent = CacheAgent::new(directory.path().join("cache"), "test-version")
+        .with_observer(observer.clone());
+
+    agent
+        .handle_requests([
+            AgentRequest::RecordBypass {
+                kind: "native-library".into(),
+            },
+            AgentRequest::RecordDebug {
+                target: "mbx::session".into(),
+                message: "rustc cache bypassed".into(),
+            },
+            AgentRequest::RecordCompilerInvocation {
+                outcome: "bypass".into(),
+                crate_name: Some("ring".into()),
+                duration_ns: 42,
+            },
+        ])
+        .await;
+    agent
+        .handle_requests([AgentRequest::RecordBypass {
+            kind: "rustdoc".into(),
+        }])
+        .await;
+    agent
+        .handle_requests([AgentRequest::RecordCompilerInvocation {
+            outcome: "bypass".into(),
+            crate_name: Some("build_script_build".into()),
+            duration_ns: 7,
+        }])
+        .await;
+
+    let events = observer.events.lock().unwrap();
+    assert!(
+        matches!(
+            events.as_slice(),
+            [
+                AgentEvent::BypassedCompilation {
+                    kind,
+                    crate_name: Some(crate_name),
+                    duration_ns: 42,
+                },
+                AgentEvent::Bypass { kind: unclaimed },
+                AgentEvent::CompilerInvocation {
+                    outcome,
+                    duration_ns: 7,
+                    ..
+                },
+            ] if kind == "native-library"
+                && crate_name == "ring"
+                && unclaimed == "rustdoc"
+                && outcome == "bypass"
+        ),
+        "{events:?}"
+    );
+    let stats = agent.stats();
+    assert_eq!(stats.bypasses.get("native-library"), Some(&1));
+    assert_eq!(stats.bypasses.get("rustdoc"), Some(&1));
+    assert_eq!(
+        stats.compiler.get("bypass").map(|stats| stats.invocations),
+        Some(2)
+    );
+}
+
+/// A shim reports its bypass reason before the compiler runs. If the shim
+/// dies before the compile finishes, its connection closes with the reason
+/// still held, and the reason is reported then rather than lost.
+#[tokio::test]
+async fn a_bypass_held_by_an_interrupted_connection_is_still_reported() {
+    let directory = tempfile::tempdir().unwrap();
+    let observer = Arc::new(RecordingObserver::default());
+    let agent = CacheAgent::new(directory.path().join("cache"), "test-version")
+        .with_observer(observer.clone());
+    let (mut client, server) = tokio::io::duplex(16 * 1024);
+    let task = tokio::spawn(async move { agent.handle_connection(server).await });
+
+    handshake(&mut client, "test-version").await;
+    let mut encoded = serde_json::to_vec(&AgentRequest::RecordBypass {
+        kind: "native-library".into(),
+    })
+    .unwrap();
+    encoded.push(b'\n');
+    client.write_all(&encoded).await.unwrap();
+    let mut response = String::new();
+    BufReader::new(&mut client)
+        .read_line(&mut response)
+        .await
+        .unwrap();
+    assert!(observer.events.lock().unwrap().is_empty());
+    drop(client);
+    task.await.unwrap().unwrap();
+
+    let events = observer.events.lock().unwrap();
+    assert!(
+        matches!(events.as_slice(), [AgentEvent::Bypass { kind }] if kind == "native-library"),
+        "{events:?}"
+    );
+}
+
 /// A cold store records every compilation it publishes as unconsulted, so its
 /// diagnostics are the only record of the keys a later checkout looks up. They
 /// were dropped at this boundary, leaving a cross-checkout miss with nothing to

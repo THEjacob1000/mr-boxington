@@ -798,8 +798,10 @@ impl Drop for CacheSession {
 /// The translation lives here rather than in the agent because the agent
 /// accounts for compilations and has no opinion about who is watching. What it
 /// reports as a compiler invocation becomes a miss, an unconsulted compilation,
-/// or a verification row, since that is the distinction a reader wants; a
-/// bypass's own compile is dropped, because the bypass row already said so.
+/// or a verification row, since that is the distinction a reader wants. A
+/// bypass the agent paired with its compile becomes one bypass row carrying
+/// the crate and compiler time; a bare bypass compile is dropped, because the
+/// bypass row already said so.
 #[derive(Clone)]
 struct EventStream {
     writer: Arc<EventWriter>,
@@ -859,6 +861,16 @@ impl AgentEventObserver for EventStream {
                 ActionOutcome::Bypass { reason: kind },
                 None,
                 0,
+                ActionDetail::default(),
+            ),
+            AgentEvent::BypassedCompilation {
+                kind,
+                crate_name,
+                duration_ns,
+            } => self.writer.action(
+                ActionOutcome::Bypass { reason: kind },
+                crate_name,
+                duration_ns,
                 ActionDetail::default(),
             ),
             // Nothing is emitted for the counter itself: the compiler
@@ -2023,6 +2035,10 @@ fn record_bypass(error: &eyre::Report) {
         reason.and_then(mbx_cache_rustc::BypassReason::remediation),
     );
     // A shim running outside a session has nowhere to report, which is fine.
+    // Sent before the compiler runs, so an interrupted compilation is still
+    // reported. The shim's connection to the agent lasts as long as the shim,
+    // so the compile time recorded afterwards arrives on the same connection,
+    // where the agent pairs it with this reason.
     let diagnostic = bypass_diagnostic(
         expected_rustc_bypass(reason),
         &format!("rustc cache bypassed: {error:#}"),
