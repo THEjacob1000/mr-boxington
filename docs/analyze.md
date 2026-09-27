@@ -71,7 +71,14 @@ the cache even when the report names it as a first build.
 
 Each compilation is compared with the most recent earlier recording of the
 same compilation unit, from this workspace or another checkout of the same
-project, the same baseline `mbx explain --last` uses. Recordings come from
+project, the same baseline `mbx explain --last` uses. A unit is one crate
+target with its crate type, target triple, and outputs, so a `cargo check`
+is compared only with earlier checks and a `cargo build` with earlier builds.
+
+A dependent is matched to the exact compilation whose artifact it read, by
+the unit hash in the artifact's file name, so a crate built for both the host
+and the target keeps a separate cause for each. A unit that records no hash,
+such as a build script compiled under Cargo 1.100, is matched by crate name. Recordings come from
 [session history](/tui#recording), which keeps a week of builds, at most 256
 of them.
 
@@ -80,8 +87,6 @@ of them.
 - Times are compiler wall time. Compilations overlap, so the total is not the
   build's duration, and the largest cause is not necessarily the one the build
   waited on.
-- Dependents are matched by crate name. A crate built for both the host and
-  the target shares one verdict.
 - Bypasses recorded without a compile time, such as rustdoc and C compiler
   bypasses, show a dash in place of a time.
 - A build that reached the per-session size limit is analyzed only as far as
