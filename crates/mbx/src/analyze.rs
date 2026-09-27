@@ -448,7 +448,7 @@ fn write_critical_path(out: &mut String, critical: &CriticalPath) {
             .collect();
         let _ = writeln!(
             out,
-            "\nonly one unit running for {}: {}",
+            "\nonly one recorded unit running for {}: {}",
             micros(critical.alone_us),
             join_names(&names),
         );

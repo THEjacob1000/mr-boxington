@@ -90,7 +90,7 @@ critical path: 531.3ms, 100% of the 531.3ms between the first unit starting and 
  35.1ms  api, 3.7ms of it waiting to start
  61.7ms  cli
 
-only one unit running for 483.5ms: api build script 308.0ms, api build script (compile) 86.0ms and cli 58.1ms
+only one recorded unit running for 483.5ms: api build script 308.0ms, api build script (compile) 86.0ms and cli 58.1ms
 ```
 
 Each step is credited with the time it added to the chain, and the steps add
@@ -100,8 +100,9 @@ last recorded dependency becoming ready and the unit starting: Cargo waiting
 for a free job, or a dependency the recording does not name. Steps under one
 percent of the path are folded into one line.
 
-The last line reports how long exactly one unit was running, and which units
-ran alone. Nothing else was building during that time.
+The last line reports how long exactly one recorded unit was running, and
+which units ran alone. Recorded units are rustc compilations and build-script
+runs; a C compiler a build script starts runs inside its build script's unit.
 
 ## Limits
 
@@ -109,6 +110,9 @@ ran alone. Nothing else was building during that time.
   not the build's duration; the critical path is the part the build waited on.
 - Build-script runs appear on the critical path but not in the cause ranking,
   which covers compilations.
+- Units are identified from Cargo's `build/<package>-<hash>` directories and,
+  from Cargo 1.100, `build/<package>/<hash>`. A rustc compilation outside those
+  names, such as one run by hand, is not on the path.
 - Dependents are matched by crate name. A crate built for both the host and
   the target shares one verdict.
 - Bypasses recorded without a compile time, such as rustdoc and C compiler

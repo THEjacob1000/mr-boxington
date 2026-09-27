@@ -379,7 +379,7 @@ fn the_report_ends_with_the_critical_path() {
     );
     assert!(text.contains("  2.00s  engine\n"), "{text}");
     assert!(
-        text.contains("only one unit running for 2.00s: engine 2.00s"),
+        text.contains("only one recorded unit running for 2.00s: engine 2.00s"),
         "{text}"
     );
 }

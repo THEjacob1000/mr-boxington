@@ -4,10 +4,16 @@
 //! Cargo gives every unit a hash and passes it to rustc as
 //! `-C extra-filename=-<hash>`. The files the unit writes, and the `--extern`
 //! paths its dependents receive, carry the same hash. A build script's run has
-//! its own directory, `build/<package>-<hash>/out`, which the crates that read
-//! it receive as `OUT_DIR`, while the script binary lives in the directory
-//! named for its compilation's hash. Those names are all this needs; Cargo's
-//! own unit graph is unstable and is not consulted.
+//! its own directory, which the crates that read it receive as `OUT_DIR`,
+//! while the script binary lives in the directory of its compilation. Those
+//! names are all this needs; Cargo's own unit graph is unstable and is not
+//! consulted.
+//!
+//! Two layouts name those directories. Through Cargo 1.99 they are
+//! `build/<package>-<hash>`, with `OUT_DIR` at `build/<package>-<hash>/out`.
+//! From Cargo 1.100 every unit has `build/<package>/<hash>/out`, which holds
+//! its outputs, and a build script compiled there is passed no
+//! `extra-filename` at all, so its `--out-dir` is what names it.
 //!
 //! An identity is a hint for analysis, never a cache input: a name this cannot
 //! read yields no identity rather than a guess.
@@ -21,9 +27,18 @@ pub(crate) fn rustc_unit(
     out_dir: Option<&Path>,
 ) -> (Option<String>, Vec<String>) {
     let mut unit = None;
+    let mut out_directory = None;
     let mut dependencies = Vec::new();
     let mut arguments = arguments.iter().filter_map(|argument| argument.to_str());
     while let Some(argument) = arguments.next() {
+        let output = match argument {
+            "--out-dir" => arguments.next(),
+            _ => argument.strip_prefix("--out-dir="),
+        };
+        if let Some(output) = output {
+            out_directory = unit_directory_hash(Path::new(output));
+            continue;
+        }
         let codegen = match argument {
             "-C" | "--codegen" => arguments.next(),
             _ => argument
@@ -53,7 +68,7 @@ pub(crate) fn rustc_unit(
     dependencies.extend(out_dir.and_then(build_script_run));
     dependencies.sort();
     dependencies.dedup();
-    (unit, dependencies)
+    (unit.or(out_directory), dependencies)
 }
 
 /// The unit a build-script run produces, and the compilation it runs.
@@ -62,11 +77,7 @@ pub(crate) fn build_script_run_unit(
     script: &Path,
 ) -> (Option<String>, Vec<String>) {
     let unit = out_dir.and_then(build_script_run);
-    let compilation = script
-        .parent()
-        .and_then(Path::file_name)
-        .and_then(|name| name.to_str())
-        .and_then(directory_hash);
+    let compilation = script.parent().and_then(unit_directory_hash);
     (unit, compilation.into_iter().collect())
 }
 
@@ -75,11 +86,33 @@ fn build_script_run(out_dir: &Path) -> Option<String> {
     if out_dir.file_name()? != "out" {
         return None;
     }
-    let directory = out_dir.parent()?.file_name()?.to_str()?;
-    directory_hash(directory).map(|hash| format!("run-{hash}"))
+    unit_directory_hash(out_dir).map(|hash| format!("run-{hash}"))
 }
 
-/// The hash in a `<package>-<hash>` directory name.
+/// The hash naming a unit's directory, in either layout: `<package>-<hash>`,
+/// or `<package>/<hash>` with its outputs in `out`.
+fn unit_directory_hash(directory: &Path) -> Option<String> {
+    let directory = if directory.file_name()? == "out" {
+        directory.parent()?
+    } else {
+        directory
+    };
+    let name = directory.file_name()?.to_str()?;
+    // A bare hash only names a unit under its package's directory in `build`;
+    // anywhere else a hex-looking name is a coincidence.
+    if is_hash(name)
+        && directory
+            .parent()
+            .and_then(Path::parent)
+            .and_then(Path::file_name)
+            .is_some_and(|build| build == "build")
+    {
+        return Some(name.to_string());
+    }
+    directory_hash(name)
+}
+
+/// The hash in a `<package>-<hash>` name.
 fn directory_hash(name: &str) -> Option<String> {
     let (_, hash) = name.rsplit_once('-')?;
     is_hash(hash).then(|| hash.to_string())
@@ -159,6 +192,52 @@ mod tests {
 
         assert_eq!(unit, None);
         assert!(dependencies.is_empty());
+    }
+
+    /// Cargo 1.100 gives every unit `build/<package>/<hash>/out`, and passes a
+    /// build script's compilation no `extra-filename`.
+    #[test]
+    fn the_cargo_1_100_layout_is_read_too() {
+        let (unit, dependencies) = rustc_unit(
+            &arguments(&[
+                "--crate-name",
+                "build_script_build",
+                "--out-dir",
+                "/t/debug/build/api/b08ebe71fd39a343/out",
+            ]),
+            None,
+        );
+        assert_eq!(unit.as_deref(), Some("b08ebe71fd39a343"));
+        assert!(dependencies.is_empty());
+
+        let (unit, dependencies) = rustc_unit(
+            &arguments(&[
+                "-C",
+                "extra-filename=-9d3b46aad32ac5c9",
+                "--out-dir",
+                "/t/debug/build/api/9d3b46aad32ac5c9/out",
+                "--extern",
+                "engine=/t/debug/build/engine/4bf0fb4dd59f0179/out/libengine-4bf0fb4dd59f0179.rmeta",
+            ]),
+            Some(Path::new("/t/debug/build/api/ba26dbedf7b267d9/out")),
+        );
+        assert_eq!(unit.as_deref(), Some("9d3b46aad32ac5c9"));
+        assert_eq!(dependencies, ["4bf0fb4dd59f0179", "run-ba26dbedf7b267d9"]);
+
+        let (unit, dependencies) = build_script_run_unit(
+            Some(Path::new("/t/debug/build/api/ba26dbedf7b267d9/out")),
+            Path::new("/t/debug/build/api/b08ebe71fd39a343/out/build-script-build"),
+        );
+        assert_eq!(unit.as_deref(), Some("run-ba26dbedf7b267d9"));
+        assert_eq!(dependencies, ["b08ebe71fd39a343"]);
+    }
+
+    #[test]
+    fn a_shared_deps_directory_names_no_unit() {
+        assert_eq!(
+            rustc_unit(&arguments(&["--out-dir", "/t/debug/deps"]), None).0,
+            None
+        );
     }
 
     #[test]

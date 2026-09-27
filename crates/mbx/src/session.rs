@@ -1281,6 +1281,7 @@ pub fn run_build_script_shim() -> ExitCode {
     if session_socket().is_none() || !build_script_execution_requested() {
         return crate::build_script::run_real();
     }
+    let _timing = crate::build_script::start_timing();
     match crate::build_script::run() {
         Ok(code) => code,
         Err(error) => {
@@ -1559,7 +1560,13 @@ pub fn run_rustc_shim() -> ExitCode {
     // that bypasses is timed through its compiler run as well.
     let _timing = crate::phase_timing::start("rustc", crate_name_argument(&arguments));
     let out_dir = std::env::var_os("OUT_DIR").map(PathBuf::from);
-    let (unit_id, dependencies) = crate::unit_graph::rustc_unit(&arguments, out_dir.as_deref());
+    // Cargo moves long argument lists into `@argfile`s; the flags naming the
+    // unit are inside them then.
+    let expanded = mbx_cache_rustc::RustcInvocation::expand_arguments(&arguments);
+    let (unit_id, dependencies) = crate::unit_graph::rustc_unit(
+        expanded.as_deref().unwrap_or(&arguments),
+        out_dir.as_deref(),
+    );
     crate::phase_timing::identify(unit_id, dependencies);
     if std::env::var_os(PREVIOUS_RUSTC_WRAPPER_ENV).is_none()
         && (!is_workspace_wrapper || cacheable_workspace_wrapper)
@@ -1689,8 +1696,10 @@ fn run_transparent_rustc(rustc: OsString, arguments: Vec<OsString>) -> ExitCode 
     {
         use std::os::unix::process::CommandExt as _;
 
-        if permit.is_none() {
-            // This process becomes the compiler, so nothing is left to time it.
+        // A probe compiles nothing worth timing, so this process can become
+        // the compiler. A real compilation is waited for even without a
+        // permit, so that its time is recorded.
+        if demand.is_none() {
             crate::phase_timing::finish();
             let error = command.exec();
             report_shim_error(&format!("the rustc shim failed to execute rustc: {error}"));
