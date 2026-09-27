@@ -353,3 +353,140 @@ fn a_build_with_nothing_uncached_says_so() {
 fn prose_wraps_at_word_boundaries() {
     assert_eq!(wrap("one two three four", 9), ["one two", "three", "four"]);
 }
+
+/// A crate edited in the same build as one of its dependencies started a
+/// change of its own. The metadata and `--extern` arguments its dependency
+/// moved are not what changed.
+#[test]
+fn an_edit_alongside_a_changed_dependency_is_charged_to_the_edited_crate() {
+    let edited = |source: &str, engine_artifact: &str| {
+        diagnostic(
+            "api",
+            &[
+                ("argument --codegen metadata", engine_artifact),
+                ("argument --extern", engine_artifact),
+            ],
+            &[("src/api.rs", source), (ENGINE_BEFORE, engine_artifact)],
+        )
+    };
+    let analysis = analyze(
+        vec![
+            action(ActionOutcome::Hit, "engine", 0, Some(engine("v1"))),
+            action(ActionOutcome::Hit, "api", 0, Some(edited("a1", "e1"))),
+        ],
+        vec![
+            action(ActionOutcome::Miss, "engine", 2, Some(engine("v2"))),
+            action(ActionOutcome::Miss, "api", 3, Some(edited("a2", "e2"))),
+        ],
+    );
+
+    assert_eq!(
+        group(&analysis, &Cause::Changed("api".into())).direct_count,
+        1
+    );
+    assert_eq!(
+        group(&analysis, &Cause::Changed("engine".into())).direct_count,
+        1
+    );
+    assert!(
+        !analysis
+            .groups
+            .contains_key(&Cause::Settings(Setting::Other))
+    );
+}
+
+/// `app` depends on `left` and `right`, and `right` depends on `left` too, so
+/// `left` is reached twice on the way to `engine`. Meeting it the second time
+/// must not make it look like a place a change started.
+#[test]
+fn a_diamond_is_charged_to_its_one_origin() {
+    let dependent = |name: &str, on: &[(&str, &str)]| {
+        let mut inputs = vec![("src/lib.rs", name)];
+        inputs.extend_from_slice(on);
+        diagnostic(name, &[], &inputs)
+    };
+    const LEFT: &str = "target/debug/deps/libleft-1a1a.rmeta";
+    const RIGHT: &str = "target/debug/deps/libright-2b2b.rmeta";
+    let build = |version: &str, seconds: [u64; 4], outcome: fn() -> ActionOutcome| {
+        vec![
+            action(outcome(), "engine", seconds[0], Some(engine(version))),
+            action(
+                outcome(),
+                "left",
+                seconds[1],
+                Some(dependent("left", &[(ENGINE_BEFORE, version)])),
+            ),
+            action(
+                outcome(),
+                "right",
+                seconds[2],
+                Some(dependent("right", &[(LEFT, version)])),
+            ),
+            action(
+                outcome(),
+                "app",
+                seconds[3],
+                Some(dependent("app", &[(LEFT, version), (RIGHT, version)])),
+            ),
+        ]
+    };
+    // `left` costs more than `engine`, which is what would make a stray
+    // intermediate root win.
+    let analysis = analyze(
+        build("v1", [0; 4], || ActionOutcome::Hit),
+        build("v2", [1, 5, 1, 1], || ActionOutcome::Miss),
+    );
+
+    assert_eq!(analysis.groups.len(), 1, "{:?}", analysis.groups);
+    assert_eq!(
+        group(&analysis, &Cause::Changed("engine".into())).dependent_count,
+        3
+    );
+}
+
+/// A compilation another checkout already built, run here with no prediction
+/// to look it up by, is not a first build.
+#[test]
+fn an_unconsulted_key_seen_before_was_not_looked_up() {
+    let analysis = analyze(
+        vec![action(ActionOutcome::Hit, "engine", 0, Some(engine("v1")))],
+        vec![action(
+            ActionOutcome::Unconsulted,
+            "engine",
+            2,
+            Some(engine("v1")),
+        )],
+    );
+
+    assert_eq!(group(&analysis, &Cause::Unpredicted).direct_count, 1);
+    assert!(
+        analysis
+            .text()
+            .contains("keys built before, but not looked up")
+    );
+}
+
+/// Nothing is left to cache in a compilation read from standard input, but
+/// one that took compiler time was still work the build did.
+#[test]
+fn expected_work_that_took_time_is_counted() {
+    let text = analyze(
+        Vec::new(),
+        vec![action(
+            ActionOutcome::Bypass {
+                reason: "standard-input".into(),
+            },
+            "piped",
+            2,
+            None,
+        )],
+    )
+    .text();
+
+    assert!(text.contains("2.00s in 1 uncached compilation"), "{text}");
+    assert!(
+        !text.contains("Cargo found every unit up to date"),
+        "{text}"
+    );
+    assert!(text.contains("expected, nothing to cache: standard-input (1)"));
+}
