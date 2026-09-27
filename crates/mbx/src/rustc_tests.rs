@@ -89,6 +89,31 @@ fn cargo_metadata_changes_are_diffs_within_one_compilation_unit() {
         current.components["argument --codegen metadata"]
     );
 }
+/// A check and a build of one crate emit different outputs, so each is
+/// compared only with earlier recordings of its own kind.
+#[test]
+fn what_a_compilation_emits_is_part_of_its_unit() {
+    let action = |emit: &str| {
+        let bytes = format!(
+            r#"{{"adapter_version":1,"arguments":["--crate-name=example","--crate-type=lib","--emit={emit}"],"compiler":{{"host":"host","rustc_version":"version","toolchain":"toolchain"}},"environment":{{}},"inputs":[],"kind":"rustc","version":1}}"#
+        )
+        .into_bytes();
+        action_diagnostic(
+            &RustcAction {
+                digest: CacheDigest::blake3(&bytes),
+                bytes,
+            },
+            "${workspace}/src/lib.rs",
+        )
+        .unwrap()
+    };
+
+    assert_ne!(
+        action("dep-info,metadata").components["compilation unit"],
+        action("dep-info,metadata,link").components["compilation unit"]
+    );
+}
+
 use crate::materialize::{apply_file_mode, make_owner_writable, stage_verified_cached_output_with};
 use std::sync::{Arc, Mutex};
 
