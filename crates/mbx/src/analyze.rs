@@ -327,11 +327,19 @@ impl Analysis {
         if self.divergences > 0 {
             let _ = writeln!(
                 out,
-                "\nwarning: {} verified {} rebuilt differently from {} cached result; the build's own warnings name each mismatch",
+                "\nwarning: {} verified {} did not match {} cached result: the rebuild failed or produced different output",
                 self.divergences,
                 plural(self.divergences, "hit", "hits"),
                 plural(self.divergences, "its", "their"),
             );
+            // The details were build-time warnings, which session history does
+            // not keep, and which the agent stops printing past its limit.
+            for line in wrap(
+                "The build printed the details as warnings, which this history does not keep. Rebuilding with MBX_VERIFY=1 in a fresh target directory repeats the comparison.",
+                72,
+            ) {
+                let _ = writeln!(out, "         {line}");
+            }
         }
         let restored = self.hits + self.verifications;
         if ranked.is_empty() && restored == 0 && self.uncached_count == 0 {
