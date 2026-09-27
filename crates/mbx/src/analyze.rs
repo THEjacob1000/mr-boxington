@@ -295,6 +295,11 @@ impl Analysis {
                 out,
                 "\nnothing was compiled or restored; Cargo found every unit up to date"
             );
+        } else if ranked.is_empty() && self.hits == 0 {
+            let _ = writeln!(
+                out,
+                "\nnothing was restored; only work with nothing to cache ran"
+            );
         } else if ranked.is_empty() {
             let _ = writeln!(out, "\nevery compilation that could be cached was restored");
         } else {

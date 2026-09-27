@@ -488,5 +488,10 @@ fn expected_work_that_took_time_is_counted() {
         !text.contains("Cargo found every unit up to date"),
         "{text}"
     );
+    assert!(!text.contains("was restored\n"), "{text}");
+    assert!(
+        text.contains("nothing was restored; only work with nothing to cache ran"),
+        "{text}"
+    );
     assert!(text.contains("expected, nothing to cache: standard-input (1)"));
 }
