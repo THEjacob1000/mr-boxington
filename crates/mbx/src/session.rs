@@ -799,9 +799,9 @@ impl Drop for CacheSession {
 /// accounts for compilations and has no opinion about who is watching. What it
 /// reports as a compiler invocation becomes a miss, an unconsulted compilation,
 /// or a verification row, since that is the distinction a reader wants. A
-/// bypass reported with its compile becomes one bypass row carrying the crate
-/// and compiler time; a bare bypass compile is dropped, because the bypass row
-/// already said so.
+/// bypass the agent paired with its compile becomes one bypass row carrying
+/// the crate and compiler time; a bare bypass compile is dropped, because the
+/// bypass row already said so.
 #[derive(Clone)]
 struct EventStream {
     writer: Arc<EventWriter>,
@@ -1565,11 +1565,13 @@ pub fn run_rustc_shim() -> ExitCode {
         // source input and must not be handed to the rustc argument parser.
         match crate::rustc::compile(&rustc, compiler_arguments, wrapper_argument) {
             Ok(exit_code) => return exit_code,
-            Err(error) => return run_transparent_rustc(rustc, arguments, bypass_requests(&error)),
+            Err(error) => {
+                record_bypass(&error);
+            }
         }
     }
 
-    run_transparent_rustc(rustc, arguments, Vec::new())
+    run_transparent_rustc(rustc, arguments)
 }
 
 /// Explicit Cargo targets must not affect host build scripts or proc macros.
@@ -1628,18 +1630,7 @@ fn executable_stem(executable: &OsStr) -> Option<&str> {
     Path::new(executable).file_stem()?.to_str()
 }
 
-/// Run the compiler without caching, reporting `bypass` -- the requests that
-/// say why -- together with the compiler time it cost.
-///
-/// The reason travels on the same connection as the invocation it explains,
-/// which is what lets the session record one bypass row naming both the crate
-/// and its compiler time. Sent separately, the reason arrived before the crate
-/// was known and the time arrived without the reason.
-fn run_transparent_rustc(
-    rustc: OsString,
-    arguments: Vec<OsString>,
-    bypass: Vec<AgentRequest>,
-) -> ExitCode {
+fn run_transparent_rustc(rustc: OsString, arguments: Vec<OsString>) -> ExitCode {
     // The compiler below may replace this process, and with it any lease on
     // a stable `OUT_DIR`; it compiles against Cargo's own tree instead.
     crate::out_dir::restore();
@@ -1693,8 +1684,6 @@ fn run_transparent_rustc(
         use std::os::unix::process::CommandExt as _;
 
         if permit.is_none() {
-            // This process becomes the compiler, so nothing is left to time it.
-            send_bypass(&bypass);
             let error = command.exec();
             report_shim_error(&format!("the rustc shim failed to execute rustc: {error}"));
             return ExitCode::from(1);
@@ -1713,15 +1702,14 @@ fn run_transparent_rustc(
                 if let Some(demand) = &demand {
                     crate::scheduler::record_compiler_memory(demand, &status);
                 }
-                record_bypassed_compilation(
-                    bypass,
+                record_compiler_invocation(
+                    "bypass",
                     crate_name.as_deref(),
                     duration_ns(started.elapsed()),
                 );
                 crate::materialize::exit_code(status)
             }
             Err(error) => {
-                send_bypass(&bypass);
                 report_shim_error(&format!("the rustc shim failed to execute rustc: {error}"));
                 ExitCode::from(1)
             }
@@ -1749,8 +1737,8 @@ fn run_transparent_rustc(
                 if let Some(demand) = &demand {
                     crate::scheduler::record_compiler_memory(demand, &status);
                 }
-                record_bypassed_compilation(
-                    bypass,
+                record_compiler_invocation(
+                    "bypass",
                     crate_name.as_deref(),
                     duration_ns(started.elapsed()),
                 );
@@ -1760,7 +1748,6 @@ fn run_transparent_rustc(
                 unsafe { windows_sys::Win32::System::Threading::ExitProcess(exit_code) }
             }
             Err(error) => {
-                send_bypass(&bypass);
                 report_shim_error(&format!("the rustc shim failed to execute rustc: {error}"));
                 ExitCode::from(1)
             }
@@ -2033,13 +2020,12 @@ pub(crate) fn learned_incremental_max_size() -> Option<u64> {
     }
 }
 
-/// The requests that tell the session this compilation was not cacheable.
+/// Tell the session that this compilation was not cacheable.
 ///
 /// Bypasses never reach the agent otherwise, so without this they are invisible
 /// outside a debug build. Reported by reason kind rather than message, since
-/// several reasons carry a path or a flag. The bypass log is written at once;
-/// the requests wait for the compiler run they describe.
-fn bypass_requests(error: &eyre::Report) -> Vec<AgentRequest> {
+/// several reasons carry a path or a flag.
+fn record_bypass(error: &eyre::Report) {
     let reason = error.downcast_ref::<mbx_cache_rustc::BypassReason>();
     let kind = reason.map_or("other", mbx_cache_rustc::BypassReason::kind);
     append_bypass_log(
@@ -2049,34 +2035,15 @@ fn bypass_requests(error: &eyre::Report) -> Vec<AgentRequest> {
         reason.and_then(mbx_cache_rustc::BypassReason::remediation),
     );
     // A shim running outside a session has nowhere to report, which is fine.
+    // Sent before the compiler runs, so an interrupted compilation is still
+    // reported. The shim's connection to the agent lasts as long as the shim,
+    // so the compile time recorded afterwards arrives on the same connection,
+    // where the agent pairs it with this reason.
     let diagnostic = bypass_diagnostic(
         expected_rustc_bypass(reason),
         &format!("rustc cache bypassed: {error:#}"),
     );
-    vec![AgentRequest::RecordBypass { kind: kind.into() }, diagnostic]
-}
-
-/// Report a bypass whose compiler run will not be timed.
-fn send_bypass(requests: &[AgentRequest]) {
-    if !requests.is_empty() {
-        // A shim running outside a session has nowhere to report, which is fine.
-        let _ = request_agent(requests);
-    }
-}
-
-/// Record a bypassed compiler run, preceded by the reason it bypassed.
-fn record_bypassed_compilation(
-    mut requests: Vec<AgentRequest>,
-    crate_name: Option<&str>,
-    duration_ns: u64,
-) {
-    requests.extend(unit_outcome_requests("bypass", crate_name));
-    requests.push(AgentRequest::RecordCompilerInvocation {
-        outcome: "bypass".into(),
-        crate_name: crate_name.map(str::to_string),
-        duration_ns,
-    });
-    let _ = request_agent(&requests);
+    let _ = request_agent(&[AgentRequest::RecordBypass { kind: kind.into() }, diagnostic]);
 }
 
 /// Tell the session that a C or C++ compilation was not cacheable.
