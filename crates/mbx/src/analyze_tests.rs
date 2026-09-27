@@ -579,3 +579,63 @@ fn a_divergent_verification_is_reported() {
     );
     assert!(text.contains("MBX_VERIFY=1"), "{text}");
 }
+
+/// The digest a real build recorded for `engine`'s `extra-filename`, whose
+/// artifact `api` read as `libengine-b772f200b11cc844.rmeta`. Matching units
+/// depends on reproducing it exactly.
+#[test]
+fn a_unit_hash_reproduces_its_recorded_digest() {
+    let digest = unit_digest("b772f200b11cc844");
+
+    assert_eq!(
+        digest.hash,
+        "896793604ab53bfa06adf6b71642b0c313c274b37e5a9659079f999414d615c8"
+    );
+    assert_eq!(digest.size, 44);
+    assert_eq!(
+        artifact_hash("${target}/debug/deps/libengine-b772f200b11cc844.rmeta").as_deref(),
+        Some("b772f200b11cc844")
+    );
+}
+
+/// `shared` is built twice under one name, once for the host and once for
+/// the target, and only the target build's inputs changed. A dependent of the
+/// target build is charged to that build, not to whichever came first.
+#[test]
+fn same_named_units_are_told_apart_by_hash() {
+    const HOST: &str = "aaaa1111";
+    const TARGET: &str = "bbbb2222";
+    let shared = |hash: &str, source: &str| {
+        let mut diagnostic = diagnostic(&format!("shared-{hash}"), &[], &[("src/lib.rs", source)]);
+        diagnostic
+            .components
+            .insert(UNIT_COMPONENT.into(), unit_digest(hash));
+        diagnostic
+    };
+    let artifact = format!("target/debug/deps/libshared-{TARGET}.rmeta");
+    let app = |version: &str| {
+        diagnostic(
+            "app",
+            &[],
+            &[("src/main.rs", "app"), (artifact.as_str(), version)],
+        )
+    };
+    let analysis = analyze(
+        vec![
+            action(ActionOutcome::Hit, "shared", 0, Some(shared(HOST, "host"))),
+            action(ActionOutcome::Hit, "shared", 0, Some(shared(TARGET, "t1"))),
+            action(ActionOutcome::Hit, "app", 0, Some(app("t1"))),
+        ],
+        vec![
+            // Recorded first, with a different cause of its own.
+            action(ActionOutcome::Unconsulted, "shared", 4, None),
+            action(ActionOutcome::Miss, "shared", 1, Some(shared(TARGET, "t2"))),
+            action(ActionOutcome::Miss, "app", 2, Some(app("t2"))),
+        ],
+    );
+
+    let changed = group(&analysis, &Cause::Changed("shared".into()));
+    assert_eq!(changed.direct_count, 1);
+    assert_eq!(changed.dependent_count, 1);
+    assert_eq!(group(&analysis, &Cause::FirstBuild).dependent_count, 0);
+}

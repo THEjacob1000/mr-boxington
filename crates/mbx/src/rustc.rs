@@ -1800,12 +1800,15 @@ fn action_diagnostic(action: &RustcAction, source: &str) -> Result<ActionDiagnos
         }
     }
     if let Some(serde_json::Value::Array(arguments)) = descriptor.remove("arguments") {
+        // What is emitted is part of the unit: `cargo check` and `cargo build`
+        // of one crate are different compilations, and comparing either with
+        // the other reports `--emit` as the change every time.
         let unit_arguments = arguments
             .iter()
             .filter(|value| {
                 value.as_str().is_some_and(|argument| {
                     argument == "--test"
-                        || ["--crate-name=", "--crate-type=", "--target="]
+                        || ["--crate-name=", "--crate-type=", "--target=", "--emit="]
                             .iter()
                             .any(|prefix| argument.starts_with(prefix))
                 })

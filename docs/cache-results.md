@@ -171,8 +171,9 @@ The usual causes, roughly in the order they show up:
   `RUSTFLAGS` between two checkouts is a different key, and the summary
   reports it as an ordinary miss. Run `mbx explain --last` to replay the most
   recent recorded build and list, per missed crate, the key inputs that
-  changed since its last recorded hit. Session history stores hashes, not
-  source contents or environment values.
+  changed since the last recording of the same compilation; a check and a
+  build of one crate are compared separately. Session history stores hashes,
+  not source contents or environment values.
 - Build-script output that differs. mbx can share Rust compilations that read
   `OUT_DIR` when the generated output matches across checkouts. A build script
   that embeds the checkout path in its output prevents that reuse. Sharing also

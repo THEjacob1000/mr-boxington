@@ -21,8 +21,8 @@ mod critical_path;
 use crate::config::Config;
 use crate::events::{ActionOutcome, SessionEvent};
 use crate::explain::{
-    Baselines, RecordedSession, changed_keys, dependencies_behind, dependency_name, guidance,
-    is_truncated, join_names, previous_recording,
+    Baselines, RecordedSession, changed_keys, dependency_name, guidance, is_truncated, join_names,
+    previous_recording,
 };
 use crate::util::format_duration;
 use critical_path::CriticalPath;
@@ -96,8 +96,35 @@ pub(crate) enum Setting {
 enum Own {
     /// The cause, and what changed under it: flag or variable names.
     Cause(Cause, Vec<String>),
-    /// Nothing of its own changed; these crates' artifacts did.
-    Dependencies(Vec<String>),
+    /// Nothing of its own changed; these units' artifacts did.
+    Dependencies(Vec<Dependency>),
+}
+
+/// A dependency whose artifact changed, as its file name identifies it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Dependency {
+    name: String,
+    /// Cargo's unit hash from `lib<name>-<hash>.rmeta`.
+    hash: Option<String>,
+}
+
+/// One uncached compilation.
+struct Record {
+    name: String,
+    duration_ns: u64,
+    own: Own,
+    /// The digest of this unit's `extra-filename` argument, which is how a
+    /// dependent's artifact path finds it.
+    unit: Option<mbx_cache_core::CacheDigest>,
+}
+
+/// Where a chain of dependency changes began.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+enum Root {
+    /// A compilation in this build.
+    Record(usize),
+    /// A crate this build did not compile, whose artifact had changed anyway.
+    Absent(String),
 }
 
 /// One cause and everything charged to it.
@@ -197,23 +224,29 @@ impl Analysis {
                     previous_recording(baselines, &name, diagnostic.as_ref()),
                 ),
             };
-            records.push((name, *duration_ns, own));
+            let unit = diagnostic
+                .as_ref()
+                .and_then(|diagnostic| diagnostic.components.get(UNIT_COMPONENT))
+                .cloned();
+            records.push(Record {
+                name,
+                duration_ns: *duration_ns,
+                own,
+                unit,
+            });
         }
-
-        // The first verdict recorded under a name stands for that name. Names
-        // are not unique -- a crate built for the host and the target shares
-        // one -- so this is the nearest the recordings come to a unit graph.
-        let mut verdicts: BTreeMap<&str, &Own> = BTreeMap::new();
-        let mut own_time: BTreeMap<&str, u64> = BTreeMap::new();
-        for (name, duration_ns, own) in &records {
-            verdicts.entry(name).or_insert(own);
-            *own_time.entry(name).or_default() += duration_ns;
-        }
+        let units = Units::of(&records);
 
         let mut groups: BTreeMap<Cause, Group> = BTreeMap::new();
         let mut uncached_ns = 0u64;
         let mut uncached_count = 0u64;
-        for (name, duration_ns, own) in &records {
+        for (index, record) in records.iter().enumerate() {
+            let Record {
+                name,
+                duration_ns,
+                own,
+                ..
+            } = record;
             // Work with nothing to cache still counts once it took compiler
             // time; Cargo's probes record none, and are not work.
             if *duration_ns > 0 || !matches!(own, Own::Cause(cause, _) if is_expected(cause)) {
@@ -223,18 +256,18 @@ impl Analysis {
             let (cause, details) = match own {
                 Own::Cause(cause, details) => (cause.clone(), Some(details)),
                 Own::Dependencies(dependencies) => {
-                    let mut seen = BTreeSet::from([name.as_str()]);
+                    let mut seen = BTreeSet::from([index]);
                     let mut roots = BTreeSet::new();
                     for dependency in dependencies {
-                        collect_roots(dependency, &verdicts, &mut seen, &mut roots);
+                        units.collect_roots(dependency, &mut seen, &mut roots);
                     }
                     // Several roots are rare; the costliest is the likeliest
                     // place the change began.
                     let root = roots
                         .into_iter()
-                        .max_by_key(|root| (own_time.get(root).copied().unwrap_or(0), *root))
-                        .unwrap_or(name.as_str());
-                    (root_cause(root, &verdicts), None)
+                        .max_by_key(|root| (units.time(root), std::cmp::Reverse(root.clone())))
+                        .unwrap_or(Root::Record(index));
+                    (units.cause(&root), None)
                 }
             };
             let group = groups.entry(cause).or_default();
@@ -533,11 +566,123 @@ fn classify_miss(
     if inputs.iter().any(|path| dependency_name(path).is_none()) {
         return Own::Cause(Cause::Changed(name.to_string()), Vec::new());
     }
-    let dependencies = dependencies_behind(&inputs);
+    // Every changed input is now a dependency's artifact.
+    let dependencies: Vec<_> = inputs
+        .iter()
+        .filter_map(|path| {
+            Some(Dependency {
+                name: dependency_name(path)?,
+                hash: artifact_hash(path),
+            })
+        })
+        .collect();
     if !dependencies.is_empty() {
         return Own::Dependencies(dependencies);
     }
     Own::Cause(Cause::Settings(Setting::Other), Vec::new())
+}
+
+/// The key component naming a unit's `extra-filename` hash.
+const UNIT_COMPONENT: &str = "argument --codegen extra-filename";
+
+/// The digest [`UNIT_COMPONENT`] records for a unit with this hash. The key
+/// stores each argument as the digest of its canonical JSON string.
+fn unit_digest(hash: &str) -> mbx_cache_core::CacheDigest {
+    mbx_cache_core::CacheDigest::blake3(format!("\"--codegen=extra-filename=-{hash}\"").as_bytes())
+}
+
+/// The unit hash in a compiler artifact's file name.
+fn artifact_hash(path: &str) -> Option<String> {
+    let file = path.rsplit(['/', '\\']).next()?;
+    let (stem, _) = file.rsplit_once('.')?;
+    let (_, hash) = stem.rsplit_once('-')?;
+    (!hash.is_empty() && hash.bytes().all(|byte| byte.is_ascii_hexdigit()))
+        .then(|| hash.to_string())
+}
+
+/// This build's uncached compilations, found by unit and by crate name.
+struct Units<'a> {
+    records: &'a [Record],
+    by_unit: BTreeMap<&'a mbx_cache_core::CacheDigest, usize>,
+    by_name: BTreeMap<&'a str, usize>,
+}
+
+impl<'a> Units<'a> {
+    fn of(records: &'a [Record]) -> Self {
+        let mut by_unit = BTreeMap::new();
+        let mut by_name = BTreeMap::new();
+        for (index, record) in records.iter().enumerate() {
+            if let Some(unit) = &record.unit {
+                by_unit.entry(unit).or_insert(index);
+            }
+            by_name.entry(record.name.as_str()).or_insert(index);
+        }
+        Self {
+            records,
+            by_unit,
+            by_name,
+        }
+    }
+
+    /// The compilation that produced a dependency's artifact.
+    ///
+    /// Matched by unit hash, which tells a crate built for the host from the
+    /// same crate built for the target. A unit that records no hash, such as
+    /// a Cargo 1.100 build script, is matched by crate name.
+    fn find(&self, dependency: &Dependency) -> Option<usize> {
+        dependency
+            .hash
+            .as_deref()
+            .and_then(|hash| self.by_unit.get(&unit_digest(hash)).copied())
+            .or_else(|| self.by_name.get(dependency.name.as_str()).copied())
+    }
+
+    /// Follow dependency verdicts to the units where the changes began.
+    fn collect_roots(
+        &self,
+        dependency: &Dependency,
+        seen: &mut BTreeSet<usize>,
+        roots: &mut BTreeSet<Root>,
+    ) {
+        let Some(index) = self.find(dependency) else {
+            roots.insert(Root::Absent(dependency.name.clone()));
+            return;
+        };
+        match &self.records[index].own {
+            // A unit reached twice, as in a diamond, was already followed; it
+            // is a path to the root, never a root of its own.
+            Own::Dependencies(dependencies) => {
+                if seen.insert(index) {
+                    for dependency in dependencies {
+                        self.collect_roots(dependency, seen, roots);
+                    }
+                }
+            }
+            Own::Cause(..) => {
+                roots.insert(Root::Record(index));
+            }
+        }
+    }
+
+    fn time(&self, root: &Root) -> u64 {
+        match root {
+            Root::Record(index) => self.records[*index].duration_ns,
+            Root::Absent(_) => 0,
+        }
+    }
+
+    /// The cause a root stands for. A root this build did not compile changed
+    /// in an earlier build, which is still a change to that crate as far as its
+    /// dependents are concerned.
+    fn cause(&self, root: &Root) -> Cause {
+        match root {
+            Root::Record(index) => match &self.records[*index].own {
+                Own::Cause(cause, _) => cause.clone(),
+                Own::Dependencies(_) => Cause::Changed(self.records[*index].name.clone()),
+            },
+            Root::Absent(name) => Cause::Changed(name.clone()),
+        }
+    }
 }
 
 /// Whether a key component changes only because a dependency did.
@@ -597,40 +742,6 @@ fn setting(components: &[String]) -> (Setting, Vec<String>) {
         return (Setting::Linker, Vec::new());
     }
     (Setting::Other, components.to_vec())
-}
-
-/// Follow dependency verdicts to the crates where the changes began.
-fn collect_roots<'a>(
-    name: &'a str,
-    verdicts: &BTreeMap<&'a str, &'a Own>,
-    seen: &mut BTreeSet<&'a str>,
-    roots: &mut BTreeSet<&'a str>,
-) {
-    match verdicts.get(name) {
-        // A crate reached twice, as in a diamond, was already followed; it
-        // is a path to the root, never a root of its own.
-        Some(Own::Dependencies(dependencies)) => {
-            if seen.insert(name) {
-                for dependency in dependencies {
-                    collect_roots(dependency, verdicts, seen, roots);
-                }
-            }
-        }
-        _ => {
-            roots.insert(name);
-        }
-    }
-}
-
-/// The cause a root crate stands for.
-///
-/// A root this build did not compile changed in an earlier build, which is
-/// still a change to that crate as far as its dependents are concerned.
-fn root_cause(root: &str, verdicts: &BTreeMap<&str, &Own>) -> Cause {
-    match verdicts.get(root) {
-        Some(Own::Cause(cause, _)) => cause.clone(),
-        _ => Cause::Changed(root.to_string()),
-    }
 }
 
 fn is_expected(cause: &Cause) -> bool {
