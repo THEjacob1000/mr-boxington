@@ -1093,6 +1093,40 @@ async fn publishes_a_complete_action_result() {
     );
 }
 
+/// A lookup is counted with the outcome it ends in, not per read, so hits,
+/// misses, and verifications always add up to the lookups. A compilation that
+/// reads several results -- a second key, a flight it waited on -- still
+/// counts once, and a compilation nothing was looked up for counts none.
+#[tokio::test]
+async fn lookups_are_counted_by_the_outcome_they_end_in() {
+    let directory = tempfile::tempdir().unwrap();
+    let agent = CacheAgent::new(directory.path(), "test-version");
+    for action in [b"first key".as_slice(), b"second key", b"after a flight"] {
+        agent
+            .respond(AgentRequest::FindActionResult {
+                action: CacheDigest::blake3(action),
+            })
+            .await;
+    }
+    assert_eq!(agent.stats().lookups, 0, "a read alone is not a lookup");
+
+    for outcome in ["miss", "unconsulted", "bypass", "verification"] {
+        assert!(matches!(
+            agent
+                .respond(AgentRequest::RecordCompilerInvocation {
+                    outcome: outcome.into(),
+                    crate_name: None,
+                    duration_ns: 1,
+                })
+                .await,
+            AgentResponse::CompilerInvocationRecorded
+        ));
+    }
+    let stats = agent.stats();
+    assert_eq!(stats.lookups, 2, "a miss and a verification: {stats:?}");
+    assert_eq!(stats.unconsulted, 0);
+}
+
 #[tokio::test]
 async fn missing_action_result_is_a_cache_miss() {
     let directory = tempfile::tempdir().unwrap();
@@ -1118,13 +1152,9 @@ async fn missing_action_result_is_a_cache_miss() {
             .await,
         AgentResponse::Error { .. }
     ));
-    assert_eq!(
-        agent.stats(),
-        AgentStats {
-            lookups: 1,
-            ..AgentStats::default()
-        }
-    );
+    // The read alone is not the lookup, and a rejected hit is not an
+    // outcome: nothing is counted until the compilation's miss is recorded.
+    assert_eq!(agent.stats(), AgentStats::default());
 
     assert!(matches!(
         agent
