@@ -770,6 +770,7 @@ mod tests {
         std::fs::create_dir_all(&shim_dir).unwrap();
         std::fs::create_dir_all(&real_dir).unwrap();
         std::fs::write(&executable, b"current mbx").unwrap();
+        make_executable(&executable);
         std::fs::write(&real_cargo, b"real cargo").unwrap();
         make_executable(&real_cargo);
 
@@ -815,6 +816,33 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn setup_warns_when_the_shim_target_was_removed() {
+        let directory = tempfile::tempdir().unwrap();
+        let removed = directory.path().join("removed/mbx");
+        let executable = directory.path().join("mbx");
+        let shim_dir = directory.path().join("shim");
+        let shim = shim_dir.join("cargo");
+        std::fs::create_dir_all(removed.parent().unwrap()).unwrap();
+        std::fs::write(&removed, b"old mbx").unwrap();
+        make_executable(&removed);
+        std::fs::write(&executable, b"current mbx").unwrap();
+        make_executable(&executable);
+        crate::cli::doctor_setup_at_action(
+            &removed,
+            &shim_dir,
+            &crate::cli::DoctorMiseScope::None,
+            crate::cli::DoctorSetupAction::Install,
+        )
+        .unwrap();
+        std::fs::remove_dir_all(removed.parent().unwrap()).unwrap();
+
+        let check = setup_check_at(&executable, &shim, Some(shim_dir.as_os_str()), false);
+        assert_eq!(check.severity, Severity::Warn);
+        assert_eq!(check.detail, "Cargo shim is outdated; run `mbx setup`");
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn setup_warns_when_the_shim_is_not_executable() {
         let directory = tempfile::tempdir().unwrap();
         let executable = directory.path().join("mbx");
@@ -822,7 +850,13 @@ mod tests {
         let shim = shim_dir.join("cargo");
         std::fs::create_dir_all(&shim_dir).unwrap();
         std::fs::write(&executable, b"current mbx").unwrap();
+        make_executable(&executable);
         std::fs::write(&shim, crate::cli::DOCTOR_CARGO_SHIM_LAUNCHER).unwrap();
+        std::fs::write(
+            shim_dir.join("mbx-target"),
+            format!("{}\n", executable.display()),
+        )
+        .unwrap();
 
         let check = setup_check_at(&executable, &shim, Some(shim_dir.as_os_str()), false);
         assert_eq!(check.severity, Severity::Warn);

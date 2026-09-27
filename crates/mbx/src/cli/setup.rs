@@ -963,6 +963,32 @@ fn configured_cargo_shim_target(install_dir: &Path) -> Option<PathBuf> {
     target.is_absolute().then_some(target)
 }
 
+/// The launcher only falls back to `mbx` on PATH when its recorded target is
+/// gone, and the shells that need the shim usually do not have mbx on PATH.
+/// A target left behind by a removed install therefore makes the shim fail.
+#[cfg(unix)]
+fn configured_cargo_shim_target_is_executable(install_dir: &Path) -> bool {
+    use std::os::unix::ffi::OsStrExt as _;
+
+    let Ok(bytes) = std::fs::read(install_dir.join(super::CARGO_SHIM_TARGET_FILE)) else {
+        return false;
+    };
+    let line = bytes
+        .split(|byte| *byte == b'\n')
+        .next()
+        .unwrap_or_default();
+    let target = Path::new(OsStr::from_bytes(line));
+    if !target.is_absolute() || !target.is_file() {
+        return false;
+    }
+    // Ask the kernel, like the launcher's `[ -x ]`, so an execute bit that only
+    // applies to another user does not count.
+    let Ok(target) = std::ffi::CString::new(line) else {
+        return false;
+    };
+    unsafe { libc::access(target.as_ptr(), libc::X_OK) == 0 }
+}
+
 fn write_cargo_shim_target(install_dir: &Path, executable: &Path) -> Result<()> {
     #[cfg(windows)]
     {
@@ -995,7 +1021,10 @@ pub(crate) fn cargo_shim_is_current(_executable: &Path, shim: &Path) -> Result<b
     }
     #[cfg(unix)]
     {
-        return Ok(std::fs::read(shim)? == CARGO_SHIM_LAUNCHER);
+        return Ok(std::fs::read(shim)? == CARGO_SHIM_LAUNCHER
+            && shim
+                .parent()
+                .is_some_and(configured_cargo_shim_target_is_executable));
     }
     #[allow(unreachable_code)]
     same_file_contents(_executable, shim)
