@@ -495,3 +495,33 @@ fn expected_work_that_took_time_is_counted() {
     );
     assert!(text.contains("expected, nothing to cache: standard-input (1)"));
 }
+
+/// A verification restores a hit and rebuilds it to check it, so a build
+/// with nothing else cacheable still restored something.
+#[test]
+fn a_verification_counts_as_restored_work() {
+    let text = analyze(
+        Vec::new(),
+        vec![
+            action(
+                ActionOutcome::Bypass {
+                    reason: "standard-input".into(),
+                },
+                "piped",
+                2,
+                None,
+            ),
+            action(
+                ActionOutcome::Verification { matched: true },
+                "engine",
+                1,
+                None,
+            ),
+        ],
+    )
+    .text();
+
+    assert!(text.contains("; 1 hit rebuilt to verify\n"), "{text}");
+    assert!(!text.contains("nothing was restored"), "{text}");
+    assert!(text.contains("every compilation that could be cached was restored"));
+}

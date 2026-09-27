@@ -112,6 +112,8 @@ struct Group {
 pub(crate) struct Analysis {
     command: String,
     hits: u64,
+    /// Hits rebuilt to check them; restored, but not counted as hits.
+    verifications: u64,
     avoided_ns: u64,
     uncached_count: u64,
     uncached_ns: u64,
@@ -123,6 +125,7 @@ pub(crate) struct Analysis {
 impl Analysis {
     pub(crate) fn of(session: &RecordedSession, baselines: &Baselines) -> Self {
         let mut hits = 0;
+        let mut verifications = 0;
         let mut avoided_ns = 0u64;
         // Each uncached compilation with its crate, time, and own verdict.
         let mut records = Vec::new();
@@ -149,7 +152,10 @@ impl Analysis {
                 }
                 // A verification rebuilds a hit on purpose; it is not a
                 // cache loss.
-                ActionOutcome::Verification { .. } => continue,
+                ActionOutcome::Verification { .. } => {
+                    verifications += 1;
+                    continue;
+                }
                 // No prediction named a key to look up, which is what happens
                 // the first time a crate builds with a set of inputs and
                 // settings. Its key can still be compared with an earlier
@@ -238,6 +244,7 @@ impl Analysis {
                 format!("cargo {}", session.command.join(" "))
             },
             hits,
+            verifications,
             avoided_ns,
             uncached_count,
             uncached_ns,
@@ -267,6 +274,14 @@ impl Analysis {
                 duration(self.avoided_ns),
             );
         }
+        if self.verifications > 0 {
+            let _ = write!(
+                out,
+                "; {} {} rebuilt to verify",
+                self.verifications,
+                plural(self.verifications, "hit", "hits"),
+            );
+        }
         out.push('\n');
         if self.truncated {
             let _ = writeln!(
@@ -290,12 +305,13 @@ impl Analysis {
                 })
                 .then_with(|| left_cause.cmp(right_cause))
         });
-        if ranked.is_empty() && self.hits == 0 && self.uncached_count == 0 {
+        let restored = self.hits + self.verifications;
+        if ranked.is_empty() && restored == 0 && self.uncached_count == 0 {
             let _ = writeln!(
                 out,
                 "\nnothing was compiled or restored; Cargo found every unit up to date"
             );
-        } else if ranked.is_empty() && self.hits == 0 {
+        } else if ranked.is_empty() && restored == 0 {
             let _ = writeln!(
                 out,
                 "\nnothing was restored; only work with nothing to cache ran"
