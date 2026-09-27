@@ -84,6 +84,14 @@ Cargo display mode. Plain disables animated output even in a terminal.
 - `plain`
 
 
+### `eager_incremental`
+
+- **Type:** `bool`
+- **Default:** `false`
+- **Set with:** `MBX_EAGER_INCREMENTAL`
+
+Keep private workspace incremental state from the first compilation, locally or in CI.
+
 ### `events`
 
 - **Type:** `bool`

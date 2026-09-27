@@ -590,6 +590,7 @@ fn cargo_with_command(
         .env_remove("MBX_INCREMENTAL")
         .env_remove("CARGO_INCREMENTAL")
         .env_remove("CI")
+        .env_remove("GITHUB_ACTIONS")
         .env_remove("MBX_RELEASE")
         // Same reason: a test asserting the default cross-checkout behaviour
         // must not read an answer out of the developer's environment.
@@ -1247,6 +1248,366 @@ fn compiled_incrementally(stats: &serde_json::Value) -> u64 {
     stats["incremental_compilations"].as_u64().unwrap_or(0)
 }
 
+#[test]
+fn eager_incremental_seeds_private_state_and_survives_a_fresh_target() {
+    let store = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    let reports = tempfile::tempdir().unwrap();
+    write_dependent_project(project.path());
+    let settings = [("MBX_EAGER_INCREMENTAL", "1"), ("CARGO_INCREMENTAL", "0")];
+    let seed = build_with(
+        project.path(),
+        store.path(),
+        &reports.path().join("seed.json"),
+        &settings,
+    )
+    .0;
+    assert_eq!(compiled_incrementally(&seed), 2, "{seed}");
+    assert_eq!(
+        seed["stored_bytes"].as_u64(),
+        Some(0),
+        "private artifacts must not be published: {seed}"
+    );
+    let state = find_files(&store.path().join("incremental"), |path| {
+        file_name_is(path, |name| name == "query-cache.bin")
+    });
+    assert_eq!(
+        state.len(),
+        2,
+        "both workspace crates should seed rustc state: {state:?}"
+    );
+    wipe_target(project.path());
+    assert!(
+        state.iter().all(|path| path.is_file()),
+        "Cargo target removal must preserve state"
+    );
+    std::fs::write(
+        project.path().join("base/src/lib.rs"),
+        "pub fn value() -> u32 { 21 }\n",
+    )
+    .unwrap();
+    std::fs::write(
+        project.path().join("above/src/main.rs"),
+        "fn main() { assert_eq!(above::doubled(), 42); }\n",
+    )
+    .unwrap();
+    let next = cargo_with(
+        project.path(),
+        store.path(),
+        &reports.path().join("next.json"),
+        &["run", "--offline", "-p", "above"],
+        &settings,
+    )
+    .0;
+    assert!(compiled_incrementally(&next) >= 2, "{next}");
+    assert_eq!(next["stored_bytes"].as_u64(), Some(0), "{next}");
+    wipe_target(project.path());
+    let disabled = build_with(
+        project.path(),
+        store.path(),
+        &reports.path().join("disabled.json"),
+        &[("MBX_EAGER_INCREMENTAL", "0")],
+    )
+    .0;
+    assert_eq!(compiled_incrementally(&disabled), 0, "{disabled}");
+    assert!(
+        disabled["stored_bytes"].as_u64().unwrap() > 0,
+        "disabling must restore shared publication: {disabled}"
+    );
+}
+
+#[test]
+fn eager_incremental_keeps_non_workspace_dependencies_shared() {
+    let store = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    let dependency = tempfile::tempdir().unwrap();
+    let reports = tempfile::tempdir().unwrap();
+    let package = dependency
+        .path()
+        .join("registry/src/fixture/external-0.1.0");
+    write_named_project(&package, "external");
+    write_project(project.path());
+    let manifest = project.path().join("Cargo.toml");
+    let mut contents = std::fs::read_to_string(&manifest).unwrap();
+    contents.push_str(&format!(
+        "\n[dependencies]\nexternal = {{ path = {:?} }}\n",
+        package.to_str().unwrap()
+    ));
+    std::fs::write(manifest, contents).unwrap();
+    generate_lockfile(project.path());
+    let settings = [
+        ("GITHUB_ACTIONS", "true"),
+        ("MBX_EAGER_INCREMENTAL", "true"),
+        ("MBX_INCREMENTAL", "1"),
+        ("CARGO_HOME", dependency.path().to_str().unwrap()),
+    ];
+    let seed = build_with(
+        project.path(),
+        store.path(),
+        &reports.path().join("seed.json"),
+        &settings,
+    )
+    .0;
+    assert_eq!(compiled_incrementally(&seed), 1, "{seed}");
+    assert!(seed["stored_bytes"].as_u64().unwrap() > 0, "{seed}");
+    wipe_target(project.path());
+    edit_project(project.path(), 1);
+    let next = build_with(
+        project.path(),
+        store.path(),
+        &reports.path().join("next.json"),
+        &settings,
+    )
+    .0;
+    assert_eq!(compiled_incrementally(&next), 1, "{next}");
+    assert!(
+        next["hits"].as_u64().unwrap_or(0) >= 1,
+        "dependency should restore: {next}"
+    );
+}
+
+#[test]
+fn learned_private_dependents_reuse_state_after_the_target_is_removed() {
+    let store = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    let reports = tempfile::tempdir().unwrap();
+    write_dependent_project(project.path());
+    build(
+        project.path(),
+        store.path(),
+        &reports.path().join("cold.json"),
+    );
+    for revision in 1..=2 {
+        if revision == 2 {
+            wipe_target(project.path());
+        }
+        std::fs::write(
+            project.path().join("base/src/lib.rs"),
+            format!("pub fn value() -> u32 {{ {revision} }}\n"),
+        )
+        .unwrap();
+        let stats = build(
+            project.path(),
+            store.path(),
+            &reports.path().join(format!("edit-{revision}.json")),
+        );
+        assert_eq!(
+            compiled_incrementally(&stats),
+            2,
+            "revision {revision}: {stats}"
+        );
+        assert_eq!(stats["stored_bytes"].as_u64(), Some(0), "{stats}");
+    }
+}
+
+#[test]
+fn private_marker_failure_stops_the_build_before_compiling_unmarked_outputs() {
+    let store = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    let reports = tempfile::tempdir().unwrap();
+    write_project(project.path());
+    build_with(
+        project.path(),
+        store.path(),
+        &reports.path().join("seed.json"),
+        &[("MBX_EAGER_INCREMENTAL", "1")],
+    );
+    wipe_target(project.path());
+    let markers = std::fs::read_dir(store.path().join("incremental"))
+        .unwrap()
+        .map(|entry| entry.unwrap().path().join("private"))
+        .find(|path| path.is_dir())
+        .unwrap();
+    std::fs::remove_dir_all(&markers).unwrap();
+    std::fs::write(&markers, "block marker directory creation").unwrap();
+    let output = mbx_command()
+        .current_dir(project.path())
+        .args(["build", "--offline"])
+        .env("MBX_CACHE_DIR", store.path())
+        .env("MBX_GC_AUTO", "0")
+        .env("MBX_EAGER_INCREMENTAL", "1")
+        .env_remove("RUSTC_WRAPPER")
+        .env_remove("RUSTC_WORKSPACE_WRAPPER")
+        .env_remove("CARGO_TARGET_DIR")
+        .output()
+        .unwrap();
+    assert!(
+        !output.status.success(),
+        "unmarked private compilation must fail: {output:?}"
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("private artifacts could not be marked"),
+        "{output:?}"
+    );
+    assert!(
+        find_files(&project.path().join("target"), |path| path
+            .extension()
+            .is_some_and(|ext| ext == "rlib" || ext == "rmeta"))
+        .is_empty()
+    );
+}
+
+#[test]
+fn verification_keeps_consumers_of_private_artifacts_out_of_the_shared_cache() {
+    for verification in ["MBX_VERIFY", "MBX_VERIFY_SAMPLE_RATE"] {
+        let store = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let reports = tempfile::tempdir().unwrap();
+        write_dependent_project(project.path());
+        let manifest = project.path().join("Cargo.toml");
+        let contents = std::fs::read_to_string(&manifest).unwrap().replace(
+            "members = [\"base\", \"above\"]",
+            "members = [\"base\", \"above\", \"top\"]",
+        );
+        std::fs::write(manifest, contents).unwrap();
+        std::fs::create_dir_all(project.path().join("top/src")).unwrap();
+        std::fs::write(project.path().join("top/Cargo.toml"),
+            "[package]\nname = \"top\"\nversion = \"0.1.0\"\nedition = \"2021\"\n[dependencies]\nabove = { path = \"../above\" }\n").unwrap();
+        std::fs::write(
+            project.path().join("top/src/lib.rs"),
+            "pub fn value() -> u32 { above::doubled() }\n",
+        )
+        .unwrap();
+        generate_lockfile(project.path());
+        let seed = cargo_with(
+            project.path(),
+            store.path(),
+            &reports.path().join("seed.json"),
+            &["build", "--offline", "-p", "base"],
+            &[("MBX_EAGER_INCREMENTAL", "1")],
+        )
+        .0;
+        assert_eq!(compiled_incrementally(&seed), 1, "{seed}");
+        assert_eq!(seed["stored_bytes"].as_u64(), Some(0), "{seed}");
+        // Cargo retains the private base artifact. The selected consumers must
+        // compile without incremental state, but must also remain private,
+        // including the transitive consumer of the non-incremental middle unit.
+        let checked = build_with(
+            project.path(),
+            store.path(),
+            &reports.path().join("checked.json"),
+            &[
+                ("MBX_EAGER_INCREMENTAL", "1"),
+                (
+                    verification,
+                    if verification == "MBX_VERIFY" {
+                        "1"
+                    } else {
+                        "100"
+                    },
+                ),
+            ],
+        )
+        .0;
+        assert_eq!(compiled_incrementally(&checked), 0, "{checked}");
+        assert_eq!(
+            checked["stored_bytes"].as_u64(),
+            Some(0),
+            "{verification}: {checked}"
+        );
+        assert_eq!(checked["hits"].as_u64(), Some(0), "{checked}");
+    }
+}
+
+#[test]
+fn nested_workspaces_keep_their_eager_policy_and_explicit_user_override() {
+    for (outer_eager, user_override) in [
+        (false, None),
+        (true, None),
+        (false, Some("0")),
+        (true, Some("1")),
+    ] {
+        let store = tempfile::tempdir().unwrap();
+        let outer = tempfile::tempdir().unwrap();
+        let inner = tempfile::tempdir().unwrap();
+        let reports = tempfile::tempdir().unwrap();
+        write_named_project(outer.path(), "outer");
+        write_named_project(inner.path(), "inner");
+        std::fs::write(
+            outer.path().join(".mbx.toml"),
+            format!("eager_incremental = {outer_eager}\n"),
+        )
+        .unwrap();
+        std::fs::write(
+            inner.path().join(".mbx.toml"),
+            format!("eager_incremental = {}\n", !outer_eager),
+        )
+        .unwrap();
+        std::fs::write(outer.path().join("build.rs"), r#"
+fn main() {
+    let expected = std::env::var("TEST_EXPECTED_OVERRIDE").unwrap();
+    assert_eq!(std::env::var("MBX_EAGER_INCREMENTAL").ok(), if expected.is_empty() { None } else { Some(expected) });
+    let output = std::process::Command::new(std::env::var_os("TEST_MBX").unwrap())
+        .current_dir(std::env::var_os("TEST_INNER").unwrap())
+        .args(["build", "--offline"])
+        .env("MBX_STATS_REPORT", std::env::var_os("TEST_INNER_REPORT").unwrap())
+        .output().unwrap();
+    assert!(output.status.success(), "{output:?}");
+}
+"#).unwrap();
+        let inner_report = reports.path().join("inner.json");
+        let mut settings = vec![
+            ("TEST_MBX", env!("CARGO_BIN_EXE_mbx")),
+            ("TEST_INNER", inner.path().to_str().unwrap()),
+            ("TEST_INNER_REPORT", inner_report.to_str().unwrap()),
+            ("TEST_EXPECTED_OVERRIDE", user_override.unwrap_or("")),
+        ];
+        if let Some(value) = user_override {
+            settings.push(("MBX_EAGER_INCREMENTAL", value));
+        }
+        build_with(
+            outer.path(),
+            store.path(),
+            &reports.path().join("outer.json"),
+            &settings,
+        );
+        let stats: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(inner_report).unwrap()).unwrap();
+        let expected = user_override.map_or(!outer_eager, |value| value == "1");
+        assert_eq!(
+            compiled_incrementally(&stats),
+            u64::from(expected),
+            "outer={outer_eager}, override={user_override:?}: {stats}"
+        );
+    }
+}
+
+#[test]
+fn eager_incremental_is_opt_in_and_yields_to_verification() {
+    for settings in [
+        vec![("CI", "1")],
+        vec![],
+        vec![("MBX_EAGER_INCREMENTAL", "1"), ("MBX_VERIFY", "1")],
+        vec![
+            ("MBX_EAGER_INCREMENTAL", "1"),
+            ("MBX_VERIFY_SAMPLE_RATE", "100"),
+        ],
+        vec![
+            ("CI", "1"),
+            ("MBX_EAGER_INCREMENTAL", "1"),
+            ("MBX_VERIFY", "1"),
+        ],
+        vec![
+            ("GITHUB_ACTIONS", "true"),
+            ("MBX_EAGER_INCREMENTAL", "1"),
+            ("MBX_VERIFY_SAMPLE_RATE", "100"),
+        ],
+    ] {
+        let store = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let reports = tempfile::tempdir().unwrap();
+        write_project(project.path());
+        let stats = build_with(
+            project.path(),
+            store.path(),
+            &reports.path().join("build.json"),
+            &settings,
+        )
+        .0;
+        assert_eq!(compiled_incrementally(&stats), 0, "{settings:?}: {stats}");
+    }
+}
+
 /// A workspace crate somebody is editing misses on every build no matter what
 /// the cache does. On its first edit, it gets its own incremental
 /// state -- which never reaches the store, because it describes one checkout's
@@ -1405,6 +1766,7 @@ fn a_failed_build_does_not_cost_the_streak() {
             .env_remove("MBX_INCREMENTAL")
             .env_remove("CARGO_INCREMENTAL")
             .env_remove("CI")
+            .env_remove("GITHUB_ACTIONS")
             .output()
             .expect("mbx should run");
         assert!(!failed.status.success(), "attempt {attempt} should fail");
@@ -3878,6 +4240,7 @@ fn build_into_target(
         .env_remove("MBX_VERIFY")
         .env_remove("MBX_VERIFY_SAMPLE_RATE")
         .env_remove("CI")
+        .env_remove("GITHUB_ACTIONS")
         .env_remove("MBX_SHARE_OUT_DIR")
         .env_remove("MBX_SOCKET")
         .env_remove("RUSTC_WRAPPER")
