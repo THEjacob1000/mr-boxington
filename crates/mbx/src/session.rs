@@ -1281,6 +1281,7 @@ pub fn run_build_script_shim() -> ExitCode {
     if session_socket().is_none() || !build_script_execution_requested() {
         return crate::build_script::run_real();
     }
+    let _timing = crate::build_script::start_timing();
     match crate::build_script::run() {
         Ok(code) => code,
         Err(error) => {
@@ -1555,6 +1556,17 @@ pub fn run_rustc_shim() -> ExitCode {
         .is_some_and(|wrapper| wrapper == rustc);
     let (wrapper_argument, compiler_arguments) = workspace_wrapper_arguments(&rustc, &arguments);
     let cacheable_workspace_wrapper = is_workspace_wrapper && wrapper_argument.is_some();
+    // Cargo moves long argument lists into `@argfile`s; the flags that name
+    // and describe the compilation are inside them then. rustc still receives
+    // the arguments as they were given.
+    let described = mbx_cache_rustc::RustcInvocation::expand_arguments(&arguments)
+        .unwrap_or_else(|_| arguments.clone());
+    // Held here rather than inside the cache attempt so that a compilation
+    // that bypasses is timed through its compiler run as well.
+    let _timing = crate::phase_timing::start("rustc", crate_name_argument(&described));
+    let out_dir = std::env::var_os("OUT_DIR").map(PathBuf::from);
+    let (unit_id, dependencies) = crate::unit_graph::rustc_unit(&described, out_dir.as_deref());
+    crate::phase_timing::identify(unit_id, dependencies);
     if std::env::var_os(PREVIOUS_RUSTC_WRAPPER_ENV).is_none()
         && (!is_workspace_wrapper || cacheable_workspace_wrapper)
     {
@@ -1571,7 +1583,7 @@ pub fn run_rustc_shim() -> ExitCode {
         }
     }
 
-    run_transparent_rustc(rustc, arguments)
+    run_transparent_rustc(rustc, arguments, &described)
 }
 
 /// Explicit Cargo targets must not affect host build scripts or proc macros.
@@ -1630,18 +1642,25 @@ fn executable_stem(executable: &OsStr) -> Option<&str> {
     Path::new(executable).file_stem()?.to_str()
 }
 
-fn run_transparent_rustc(rustc: OsString, arguments: Vec<OsString>) -> ExitCode {
+/// Run the compiler without caching. `described` is `arguments` with any
+/// `@argfile` expanded, which is where to look for what is being compiled;
+/// rustc itself is given `arguments` unchanged.
+fn run_transparent_rustc(
+    rustc: OsString,
+    arguments: Vec<OsString>,
+    described: &[OsString],
+) -> ExitCode {
     // The compiler below may replace this process, and with it any lease on
     // a stable `OUT_DIR`; it compiles against Cargo's own tree instead.
     crate::out_dir::restore();
-    let crate_name = crate_name_argument(&arguments);
+    let crate_name = crate_name_argument(described);
     // A bypassed compilation is still a real compiler process the machine has
     // to pay for. Probe invocations pass through unscheduled: cargo runs them
     // to learn about the compiler before it plans anything, so making one wait
     // for a permit would stall a build's startup behind its siblings' permits.
     // Most probes carry no --crate-name; the target-info queries carry the
     // placeholder name `___` alongside `--print`, and compile nothing.
-    let is_query = arguments.iter().any(|argument| {
+    let is_query = described.iter().any(|argument| {
         argument == "-"
             || argument
                 .to_str()
@@ -1650,7 +1669,7 @@ fn run_transparent_rustc(rustc: OsString, arguments: Vec<OsString>) -> ExitCode 
     let demand = crate_name
         .as_deref()
         .filter(|_| !is_query)
-        .map(|name| crate::scheduler::Demand::new(name, links_natively(&arguments)));
+        .map(|name| crate::scheduler::Demand::new(name, links_natively(described)));
     let permit = demand
         .as_ref()
         .and_then(|demand| crate::scheduler::pool().and_then(|pool| pool.admit(demand)));
@@ -1683,7 +1702,11 @@ fn run_transparent_rustc(rustc: OsString, arguments: Vec<OsString>) -> ExitCode 
     {
         use std::os::unix::process::CommandExt as _;
 
-        if permit.is_none() {
+        // A probe compiles nothing worth timing, so this process can become
+        // the compiler. A real compilation is waited for even without a
+        // permit, so that its time is recorded.
+        if demand.is_none() {
+            crate::phase_timing::finish();
             let error = command.exec();
             report_shim_error(&format!("the rustc shim failed to execute rustc: {error}"));
             return ExitCode::from(1);
@@ -1691,12 +1714,15 @@ fn run_transparent_rustc(rustc: OsString, arguments: Vec<OsString>) -> ExitCode 
         // A held permit must be released when the compiler finishes, and its
         // lease lock is close-on-exec, so this process has to outlive the
         // compiler rather than become it.
-        match command.spawn().and_then(|mut child| {
+        let compiler = crate::phase_timing::phase("compiler");
+        let waited = command.spawn().and_then(|mut child| {
             if let Some(action) = &mut action {
                 action.started();
             }
             child.wait()
-        }) {
+        });
+        drop(compiler);
+        match waited {
             Ok(status) => {
                 drop(permit);
                 if let Some(demand) = &demand {
@@ -1720,7 +1746,8 @@ fn run_transparent_rustc(rustc: OsString, arguments: Vec<OsString>) -> ExitCode 
         use std::os::windows::io::AsRawHandle as _;
         use windows_sys::Win32::System::Threading::GetExitCodeProcess;
 
-        match command.spawn().and_then(|mut child| {
+        let compiler = crate::phase_timing::phase("compiler");
+        let waited = command.spawn().and_then(|mut child| {
             let status = child.wait()?;
             let mut exit_code = 1;
             // SAFETY: the child owns a valid process handle until it is
@@ -1731,7 +1758,9 @@ fn run_transparent_rustc(rustc: OsString, arguments: Vec<OsString>) -> ExitCode 
             } else {
                 Ok((exit_code, status))
             }
-        }) {
+        });
+        drop(compiler);
+        match waited {
             Ok((exit_code, status)) => {
                 drop(permit);
                 if let Some(demand) = &demand {
@@ -1742,6 +1771,8 @@ fn run_transparent_rustc(rustc: OsString, arguments: Vec<OsString>) -> ExitCode 
                     crate_name.as_deref(),
                     duration_ns(started.elapsed()),
                 );
+                // ExitProcess skips Rust destructors, including the timer.
+                crate::phase_timing::finish();
                 // SAFETY: This process is only a transparent compiler wrapper.
                 // ExitProcess is required to preserve Windows exception codes,
                 // which cannot be represented by stable Rust's ExitCode API.

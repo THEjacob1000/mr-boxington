@@ -272,6 +272,22 @@ fn archive_timestamp_key() -> Option<String> {
     crate::ar::effective_zero_ar_date(ar_mode(), ar_profile().as_deref(), inherited.as_deref())
 }
 
+/// Time this build-script run as its own unit, until the returned guard drops.
+///
+/// Held by the shim around both the cached run and the uncached fallback, so
+/// a run that falls back is timed through the script it runs.
+pub(crate) fn start_timing() -> Option<crate::phase_timing::Invocation> {
+    let invoked = session::build_script_invocation_path()?;
+    let package = std::env::var("CARGO_PKG_NAME").unwrap_or_else(|_| cargo_package_name().into());
+    let timing =
+        crate::phase_timing::start("build-script", Some(format!("{package} build script")));
+    let out_dir = std::env::var_os("OUT_DIR").map(std::path::PathBuf::from);
+    let (unit_id, dependencies) =
+        crate::unit_graph::build_script_run_unit(out_dir.as_deref(), &invoked);
+    crate::phase_timing::identify(unit_id, dependencies);
+    Some(timing)
+}
+
 /// Run the preserved program without consulting the cache.
 pub(crate) fn run_real() -> ExitCode {
     let Some(invoked) = session::build_script_invocation_path() else {
