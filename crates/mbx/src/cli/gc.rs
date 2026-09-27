@@ -112,10 +112,11 @@ pub(super) fn run(
             );
         }
     }
-    let pruned = target::collect(
+    let pruned = target::collect_by(
         &config.target.root,
         target_budget,
         retention.target_max_age,
+        &retention.target_precedence,
         dry_run,
     );
     let projected_target_bytes = match &pruned {
@@ -716,10 +717,11 @@ pub(super) fn prune_targets(
         incremental_remaining,
         &mut low_disk,
     );
-    let mut report = match target::collect(
+    let mut report = match target::collect_by(
         &config.target.root,
         target_budget,
         retention.target_max_age,
+        &retention.target_precedence,
         false,
     ) {
         Ok(pruned) => {

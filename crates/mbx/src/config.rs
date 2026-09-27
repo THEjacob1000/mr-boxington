@@ -404,6 +404,15 @@ struct RawTarget {
     /// long, or "none".
     #[usage(env = "MBX_TARGET_MAX_AGE", default = "30d", ty = "duration")]
     max_age: String,
+    /// Checkouts whose managed targets are never collected for age or size.
+    /// An absolute path covers the checkouts under it; a relative one matches
+    /// wherever it appears in a checkout's path.
+    #[usage(env = "MBX_TARGET_KEEP", parse = "list_by_comma")]
+    keep: Option<Vec<String>>,
+    /// Checkouts whose managed targets are collected first when targets are
+    /// over budget, such as ".claude/worktrees". Matched like `target.keep`.
+    #[usage(env = "MBX_TARGET_EVICT_FIRST", parse = "list_by_comma")]
+    evict_first: Option<Vec<String>>,
 }
 
 #[derive(Debug, usage::Config)]
@@ -746,6 +755,8 @@ pub(crate) struct RetentionSettings {
     pub incremental_max_bytes: Option<u64>,
     pub incremental_max_age: Option<Duration>,
     pub max_total_bytes: Option<u64>,
+    /// Checkouts whose targets `target.keep` and `target.evict_first` set apart.
+    pub target_precedence: crate::target::Precedence,
     /// Free space below which a sweep collects past the budgets above;
     /// `None` never does.
     pub min_free: Option<MinFree>,
@@ -911,6 +922,7 @@ impl Default for RetentionSettings {
             incremental_max_bytes: Some(INCREMENTAL_BUDGET.fallback),
             incremental_max_age: Some(DEFAULT_TARGET_MAX_AGE),
             max_total_bytes: None,
+            target_precedence: crate::target::Precedence::default(),
             // Off, unlike the configured default: whether a disk is short
             // depends on the machine a test happens to run on.
             min_free: None,
@@ -1081,6 +1093,12 @@ impl Config {
                 .transpose()
                 .wrap_err("invalid gc.max_total_size")?
                 .flatten(),
+            target_precedence: crate::target::Precedence {
+                keep: checkout_patterns(raw.target.keep.as_deref(), dirs::home_dir())
+                    .wrap_err("invalid target.keep")?,
+                evict_first: checkout_patterns(raw.target.evict_first.as_deref(), dirs::home_dir())
+                    .wrap_err("invalid target.evict_first")?,
+            },
             min_free: match raw.gc.min_free_size.as_deref() {
                 None => Some(MinFree::ShareOfDisk),
                 Some(value) => parse_optional_byte_size(value)
@@ -1479,6 +1497,42 @@ pub(crate) fn parse_optional_byte_size(value: &str) -> Result<Option<u64>> {
     parse_byte_size(value).map(Some)
 }
 
+/// `target.keep` or `target.evict_first` as paths to match checkouts against.
+///
+/// A leading `~` is the home directory, and an absolute entry that exists is
+/// resolved the way checkout paths are recorded, so a symlinked home still
+/// matches. Relative entries stay relative: they match anywhere.
+///
+/// A `~` entry with no home directory to expand it is an error: read as a
+/// relative path it would match nothing, and a `target.keep` that silently
+/// protects nothing is worse than a configuration that fails to load.
+fn checkout_patterns(entries: Option<&[String]>, home: Option<PathBuf>) -> Result<Vec<PathBuf>> {
+    entries
+        .unwrap_or_default()
+        .iter()
+        .map(|entry| entry.trim())
+        .filter(|entry| !entry.is_empty())
+        .map(|entry| {
+            let path = match entry.strip_prefix('~') {
+                Some(rest) if rest.is_empty() || rest.starts_with(['/', '\\']) => {
+                    let Some(home) = home.clone() else {
+                        eyre::bail!("{entry:?} starts with ~, but there is no home directory");
+                    };
+                    std::fs::canonicalize(&home)
+                        .unwrap_or(home)
+                        .join(rest.trim_start_matches(['/', '\\']))
+                }
+                _ => PathBuf::from(entry),
+            };
+            Ok(if path.is_absolute() {
+                std::fs::canonicalize(&path).unwrap_or(path)
+            } else {
+                path
+            })
+        })
+        .collect()
+}
+
 fn parse_optional_duration(value: &str) -> Result<Option<Duration>> {
     if is_no_limit(value) {
         return Ok(None);
@@ -1790,6 +1844,59 @@ mod tests {
         assert!(
             format!("{error:#}").contains("gc.min_free_size"),
             "{error:#}"
+        );
+    }
+
+    #[test]
+    fn target_precedence_reads_lists_from_the_file_and_environment() {
+        let (_, retention) = configured_retention(None, &[]).unwrap();
+        assert_eq!(
+            retention.target_precedence,
+            crate::target::Precedence::default()
+        );
+
+        let (_, retention) = configured_retention(
+            Some("[target]\nkeep = [\"~/src/app\"]\nevict_first = [\".claude/worktrees\"]"),
+            &[],
+        )
+        .unwrap();
+        let home = dirs::home_dir().unwrap();
+        let home = std::fs::canonicalize(&home).unwrap_or(home);
+        assert_eq!(retention.target_precedence.keep, [home.join("src/app")]);
+        assert_eq!(
+            retention.target_precedence.evict_first,
+            [PathBuf::from(".claude/worktrees")]
+        );
+
+        let (_, retention) = configured_retention(
+            None,
+            &[("MBX_TARGET_EVICT_FIRST", ".claude/worktrees, scratch")],
+        )
+        .unwrap();
+        assert_eq!(
+            retention.target_precedence.evict_first,
+            [PathBuf::from(".claude/worktrees"), PathBuf::from("scratch")]
+        );
+    }
+
+    #[test]
+    fn a_home_relative_pattern_without_a_home_is_an_error() {
+        let entries = ["~/src/app".to_string(), "scratch".to_string()];
+
+        let error = checkout_patterns(Some(&entries), None).unwrap_err();
+        assert!(format!("{error:#}").contains("~/src/app"), "{error:#}");
+        assert_eq!(
+            checkout_patterns(Some(&entries[1..]), None).unwrap(),
+            [PathBuf::from("scratch")],
+            "entries that need no home still load"
+        );
+        assert_eq!(
+            checkout_patterns(
+                Some(&entries[..1]),
+                Some(PathBuf::from("/nonexistent-home"))
+            )
+            .unwrap(),
+            [PathBuf::from("/nonexistent-home/src/app")]
         );
     }
 

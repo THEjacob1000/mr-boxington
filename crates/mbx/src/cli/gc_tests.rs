@@ -9,6 +9,7 @@ fn combined_budget_reserves_the_full_action_store_allowance() {
         incremental_max_bytes: Some(20),
         incremental_max_age: None,
         max_total_bytes: Some(100),
+        target_precedence: Default::default(),
         min_free: None,
     };
 
@@ -189,6 +190,7 @@ fn always_short() -> RetentionSettings {
         incremental_max_age: None,
         max_total_bytes: None,
         min_free: Some(crate::config::MinFree::Bytes(u64::MAX / 2)),
+        target_precedence: Default::default(),
     }
 }
 

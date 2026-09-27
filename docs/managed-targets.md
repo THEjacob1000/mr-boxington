@@ -198,6 +198,8 @@ A target directory is removed when any of these is true:
 - The disk is low on space. See [When the disk runs low](#when-the-disk-runs-low).
 
 Cached compilations shared with a live checkout remain protected throughout.
+[Keep or evict specific checkouts](#keep-or-evict-specific-checkouts) changes
+the order for checkouts you list.
 
 ### Unused build units
 
@@ -239,6 +241,34 @@ measured, mbx uses 20 GiB, 30 GiB, and 20 GiB respectively. An explicit budget
 overrides these defaults, and `mbx gc --dry-run` previews the effect of a policy
 without deleting anything.
 
+### Keep or evict specific checkouts
+
+`target.keep` lists checkouts whose targets are never collected for age or
+size, and whose unused build units are left alone. A kept target is still
+removed when its checkout is gone. `target.evict_first` lists checkouts whose
+targets go before any other when the managed targets are over budget:
+
+```toml
+[target]
+keep = ["~/src/app"]
+evict_first = [".claude/worktrees"]
+```
+
+An absolute entry, or one starting with `~`, covers the checkouts at or under
+that directory. A relative entry matches wherever its components appear
+together in a checkout's path, so `.claude/worktrees` covers the worktrees
+coding agents create under `.claude/worktrees` in any repository.
+
+When both lists match a checkout, the entry that names more of its path wins.
+With the example above, `~/src/app` is kept and its agent worktrees under
+`~/src/app/.claude/worktrees` are evicted first. A tie keeps.
+
+Evict-first targets are collected least recently used first, ahead of the rest.
+The most recently used target directory is still spared, whichever list it is
+on. Kept targets count toward `target.max_size`, so the other checkouts' targets
+make room for them. The environment variables take comma-separated lists:
+`MBX_TARGET_EVICT_FIRST=.claude/worktrees,scratch`.
+
 ### When the disk runs low
 
 The budgets above are shares of the disk's size, so they hold even when
@@ -252,7 +282,9 @@ shortfall from per-checkout state regardless of the budgets:
 
 1. Learned incremental state and generated source trees, least recently used
    first.
-2. Managed target directories, least recently used first.
+2. Managed target directories, least recently used first, with
+   `target.evict_first` checkouts ahead of the rest and `target.keep` checkouts
+   left alone.
 
 The most recently used target directory, and anything a running build is
 using, is kept as usual. The action store stays at `gc.max_size`, because every
