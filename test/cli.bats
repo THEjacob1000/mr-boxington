@@ -73,6 +73,104 @@ setup() {
   assert_output --partial "0 B"
 }
 
+# Where the platform configuration directory puts mbx's global file.
+global_config_file() {
+  if [[ "$(uname -s)" == Darwin ]]; then
+    echo "$HOME/Library/Application Support/mbx/config.toml"
+  else
+    echo "$XDG_CONFIG_HOME/mbx/config.toml"
+  fi
+}
+
+@test "settings set writes the global configuration file and unset removes it" {
+  config="$(global_config_file)"
+
+  run "$MBX_BIN" settings set gc.max_size 20GiB
+  assert_success
+  assert_file_exists "$config"
+  run "$MBX_BIN" settings get gc.max_size
+  assert_success
+  assert_output "20GiB"
+  run "$MBX_BIN" settings ls gc
+  assert_success
+  assert_line 'gc.max_size = "20GiB"'
+
+  MBX_GC_MAX_SIZE=30GiB run "$MBX_BIN" settings get gc.max_size
+  assert_success
+  assert_output "30GiB"
+
+  run "$MBX_BIN" settings unset gc.max_size
+  assert_success
+  run "$MBX_BIN" settings get gc.max_size
+  assert_success
+  assert_output ""
+}
+
+@test "settings set leaves the file alone when the value does not load" {
+  config="$(global_config_file)"
+
+  run "$MBX_BIN" settings set gc.interval soon
+  assert_failure
+  assert_output --partial "invalid gc.interval"
+  assert_file_not_exists "$config"
+
+  run "$MBX_BIN" settings set savings plain
+  assert_success
+  run "$MBX_BIN" settings set gc.max_size lots
+  assert_failure
+  assert_output --partial "was not changed"
+  run cat "$config"
+  assert_output 'savings = "plain"'
+}
+
+@test "settings set repairs one setting while another is still invalid" {
+  config="$(global_config_file)"
+  mkdir -p "$(dirname "$config")"
+  printf 'savings = "loud"\ngc.interval = "soon"\n' >"$config"
+
+  run "$MBX_BIN" settings set savings plain
+  assert_success
+  assert_output --partial "invalid gc.interval"
+  run "$MBX_BIN" settings unset gc.interval
+  assert_success
+  run cat "$config"
+  assert_output 'savings = "plain"'
+  run "$MBX_BIN" stats
+  assert_success
+}
+
+@test "an invalid configuration says how to repair it" {
+  config="$(global_config_file)"
+  mkdir -p "$(dirname "$config")"
+  printf '[gc]\nsavings = "plain"\n' >"$config"
+
+  run "$MBX_BIN" stats
+  assert_failure
+  assert_output --partial "unknown setting \`gc.savings\`"
+  assert_output --partial "\`mbx settings unset gc.savings\` removes it"
+
+  run "$MBX_BIN" settings unset gc.savings
+  assert_success
+  printf 'summary = "loud"\n' >"$config"
+  run "$MBX_BIN" stats
+  assert_failure
+  assert_output --partial "\`mbx settings set summary <value>\` replaces it"
+
+  MBX_SUMMARY=loud run "$MBX_BIN" doctor
+  assert_output --partial "MBX_SUMMARY sets it; change or unset that variable"
+}
+
+@test "settings ls does not print the remote token" {
+  MBX_REMOTE_TOKEN=very-secret run "$MBX_BIN" settings ls remote
+  assert_success
+  assert_line "remote.token is set; \`mbx settings get remote.token\` prints it"
+  refute_output --partial "very-secret"
+
+  MBX_REMOTE_TOKEN=very-secret run "$MBX_BIN" settings get remote.token
+  assert_success
+  assert_output "very-secret"
+}
+
 @test "explain reports why compilations bypass the cache" {
   cargo init --lib --vcs none explained-project
   cd explained-project
