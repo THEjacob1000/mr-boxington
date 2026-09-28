@@ -490,18 +490,6 @@ impl RustcInvocation {
                 } else {
                     working_dir.join(path)
                 };
-                // An inert directory outside every mapped root enters the key
-                // by its literal path in the arguments, not by its contents --
-                // predictions skip it under the same rule, so both discovery
-                // paths agree on the action key.
-                if self.native_search_is_inert()
-                    && matches!(
-                        super::normalize_mapped_path(&directory, &working_dir, path_mappings),
-                        Err(BypassReason::UnmappedAbsolutePath(_))
-                    )
-                {
-                    continue;
-                }
                 collect_native_directory(
                     &directory,
                     &admitted_roots,
@@ -853,12 +841,12 @@ mod tests {
         );
     }
 
-    /// The MSVC toolset directories `cc`-built dependencies hand to every
-    /// downstream compile on Windows: absolute, version-stamped, and outside
-    /// every mapped root.
+    /// An external MSVC toolset directory, outside every mapped root.
     fn toolchain_native_directory(version: &str) -> PathBuf {
         if cfg!(windows) {
-            PathBuf::from(format!(r"C:\Program Files\MSVC\{version}\lib\x64"))
+            PathBuf::from(format!(
+                r"C:\Program Files\Microsoft Visual Studio\2022\BuildTools\VC\Tools\MSVC\{version}\lib\x64"
+            ))
         } else {
             PathBuf::from(format!("/opt/msvc/{version}/lib/x64"))
         }
@@ -891,8 +879,9 @@ mod tests {
         }
     }
 
+    #[cfg(windows)]
     #[test]
-    fn unmapped_native_directory_is_keyed_by_path_for_library_emits() {
+    fn unmapped_toolchain_directory_cannot_hide_a_static_archive() {
         let directory = tempfile::tempdir().unwrap();
         let root = directory.path();
         let source = root.join("lib.rs");
@@ -902,43 +891,75 @@ mod tests {
         let mappings = vec![PathMapping::new(root, "workspace")];
         let dep_info = RustcDepInfo::parse(&format!("output: {}\n", source.display())).unwrap();
 
-        // The directory does not even exist: its contents are not inputs.
-        let discovered = invocation
-            .discover_inputs_with_mappings(
+        let context = library_context(root, mappings.clone());
+        assert!(matches!(
+            invocation.invocation_digest(&context),
+            Err(BypassReason::UnmappedAbsolutePath(path)) if path == toolchain
+        ));
+        assert_eq!(
+            invocation.discover_inputs_with_mappings(
                 &dep_info,
                 root,
                 &mappings,
                 &mbx_cache_core::NoFileDigestCache,
-            )
-            .unwrap();
-        assert_eq!(discovered.inputs.len(), 1);
-        assert_eq!(discovered.inputs[0].path, source);
-
-        // The literal path is key material, so a toolset update misses.
-        let context = library_context(root, mappings.clone());
-        let digest = invocation.invocation_digest(&context).unwrap();
-        let updated = library_with_native_search(&source, &toolchain_native_directory("14.52.0"));
-        assert_ne!(digest, updated.invocation_digest(&context).unwrap());
-
-        // The prediction skips the directory the same way discovery does, so a
-        // build that replays it derives the action key dep-info would have.
-        let mut recorded = context.clone();
-        discovered.clone().apply_to(&mut recorded).unwrap();
-        let action = invocation.action(recorded).unwrap();
-        let prediction = invocation.prediction(&context, &discovered).unwrap();
-        let replayed = prediction
-            .discover(
-                root,
-                &context.path_mappings,
-                &mbx_cache_core::NoFileDigestCache,
-            )
-            .unwrap();
-        let mut replay_context = context.clone();
-        replayed.apply_to(&mut replay_context).unwrap();
-        assert_eq!(
-            invocation.action(replay_context).unwrap().digest,
-            action.digest
+            ),
+            Err(BypassReason::UnsupportedSearchPath("native".into()))
         );
+    }
+
+    #[test]
+    fn source_level_static_link_cannot_hide_an_unmapped_archive() {
+        let directory = tempfile::tempdir().unwrap();
+        let workspace = directory.path().join("workspace");
+        let external = directory.path().join("external");
+        std::fs::create_dir(&workspace).unwrap();
+        std::fs::create_dir(&external).unwrap();
+        let source = workspace.join("lib.rs");
+        std::fs::write(
+            &source,
+            "#[link(name = \"foo\", kind = \"static\")] unsafe extern \"C\" {}\n",
+        )
+        .unwrap();
+        std::fs::write(external.join("libfoo.a"), b"first archive").unwrap();
+        let invocation = library_with_native_search(&source, &external);
+        let mappings = vec![PathMapping::new(&workspace, "workspace")];
+        let context = library_context(&workspace, mappings.clone());
+        let dep_info = RustcDepInfo::parse(&format!("output: {}\n", source.display())).unwrap();
+
+        // rustc's dep-info names the source but not an archive from #[link].
+        // A path-only key would restore a stale rlib after libfoo.a changed.
+        assert!(matches!(
+            invocation.invocation_digest(&context),
+            Err(BypassReason::UnmappedAbsolutePath(path)) if path == external
+        ));
+        assert_eq!(
+            invocation.discover_inputs_with_mappings(
+                &dep_info,
+                &workspace,
+                &mappings,
+                &mbx_cache_core::NoFileDigestCache,
+            ),
+            Err(BypassReason::UnsupportedSearchPath("native".into()))
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn project_directory_with_toolchain_suffix_is_not_trusted() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("workspace");
+        std::fs::create_dir(&root).unwrap();
+        let source = root.join("lib.rs");
+        std::fs::write(&source, "pub fn library() {}\n").unwrap();
+        let fake_toolchain = directory.path().join("MSVC/14.51.36231/lib/x64");
+        let invocation = library_with_native_search(&source, &fake_toolchain);
+        let context = library_context(&root, vec![PathMapping::new(&root, "workspace")]);
+
+        // The apparent toolset version cannot make a mutable project archive inert.
+        assert!(matches!(
+            invocation.invocation_digest(&context),
+            Err(BypassReason::UnmappedAbsolutePath(path)) if path == fake_toolchain
+        ));
     }
 
     #[test]

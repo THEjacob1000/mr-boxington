@@ -544,24 +544,6 @@ impl RustcInvocation {
         enabled
     }
 
-    /// Whether the contents of native search directories cannot reach this
-    /// invocation's outputs.
-    ///
-    /// A library emit never runs a linker, so the only file rustc reads out of
-    /// a `-L native` directory is a static archive it bundles into the rlib.
-    /// One named by `-l static` is resolved at parse time and hashed as a
-    /// required input, so the directory it came from need not be walked for
-    /// it. On Windows every crate downstream of a `cc`-built dependency
-    /// carries the MSVC toolset's `-L native` directories, which sit outside
-    /// every checkout root; treating them as content inputs would leave all of
-    /// those compilations permanently uncacheable. A `#[link]` attribute
-    /// naming a bundled static library could in principle reach through such a
-    /// directory without an `-l` flag, but toolchain directories are
-    /// version-stamped by their path, which the key still carries verbatim.
-    fn native_search_is_inert(&self) -> bool {
-        self.link_output == LinkOutput::Library
-    }
-
     /// Return the source input passed to rustc.
     pub fn source(&self) -> &Path {
         &self.source
@@ -797,19 +779,7 @@ impl RustcInvocation {
             if let Argument::SearchPath { kind, path } = argument
                 && kind == "native"
             {
-                match builder.normalize_path(path) {
-                    Ok(normalized) => {
-                        native_directories.insert(normalized);
-                    }
-                    // Inert and outside every mapped root: the directory
-                    // contributes no content inputs, so the prediction has
-                    // nothing to replay for it. Input discovery skips it the
-                    // same way, which is what keeps the predicted action key
-                    // equal to the one dep-info discovery builds.
-                    Err(BypassReason::UnmappedAbsolutePath(_)) if self.native_search_is_inert() => {
-                    }
-                    Err(error) => return Err(error),
-                }
+                native_directories.insert(builder.normalize_path(path)?);
             }
         }
         // A file beneath a recorded directory is rediscovered by walking that
@@ -2374,25 +2344,7 @@ impl<'a> ActionBuilder<'a> {
             Argument::Plain(value) => Ok(value.clone()),
             Argument::Path { flag, path } => Ok(format!("{flag}={}", self.normalize_path(path)?)),
             Argument::SearchPath { kind, path } => {
-                let text = match self.normalize_path(path) {
-                    Ok(text) => text,
-                    // A native directory outside every mapped root is a host
-                    // toolchain installation, not a checkout location. Its
-                    // literal path is the key material: the path is
-                    // version-stamped on the platforms that pass one (the MSVC
-                    // toolset, the Windows SDK), so hosts that differ miss,
-                    // which is the same identity-over-content stance
-                    // [`LinkerIdentity`] takes.
-                    Err(BypassReason::UnmappedAbsolutePath(absolute))
-                        if kind == "native" && self.invocation.native_search_is_inert() =>
-                    {
-                        absolute
-                            .to_str()
-                            .ok_or(BypassReason::NonUtf8Path(absolute.clone()))?
-                            .to_string()
-                    }
-                    Err(error) => return Err(error),
-                };
+                let text = self.normalize_path(path)?;
                 Ok(format!("-L{kind}={text}"))
             }
             Argument::Extern { name, path } => match path {

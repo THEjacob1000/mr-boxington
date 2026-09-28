@@ -6,7 +6,7 @@
 driver clones a pinned third-party subject and runs the same Cargo invocation
 under raw cargo, mbx, and kache across scenarios drawn from the live hk and
 mise cache workflows: a warm store with a fresh target, the next commit on the
-branch, and a one-line edit rebuilt in place.
+branch, a second worktree, and a one-line edit rebuilt in place.
 
 Every timing is wall clock around one build, the way CI experiences it. A
 timed scenario is repeated (`--trials`) and reports the median trial with
@@ -105,6 +105,15 @@ SCENARIOS: dict[str, dict[str, object]] = {
             "warm store, fresh target -- CI restoring the same commit; "
             "plain Cargo has no cache to restore"
         ),
+        "repeatable": True,
+    },
+    "worktree": {
+        "tools": ("cargo", "mbx", "kache"),
+        "description": (
+            "first build in a second git worktree at the same commit, with a warm "
+            "local store and each tool's default target placement"
+        ),
+        "baseline": "uncached baseline",
         "repeatable": True,
     },
     "commit": {
@@ -328,23 +337,19 @@ def clones_supported(path: Path) -> bool | None:
         shutil.rmtree(probe, ignore_errors=True)
 
 
-def tool_version(command: str, toolchain: str | None = None) -> str | None:
-    """What one tool calls itself, under the toolchain the builds used.
-
-    `cargo` and `rustc` are rustup shims. Asking them without a pin reports the
-    machine's default, which is what the timed builds use unless a subject names
-    a toolchain of its own.
-    """
+def tool_version(
+    command: str, *, checkout: Path | None = None, environment: dict[str, str] | None = None
+) -> str | None:
+    """What the executable used by a build reports about itself."""
     executable = shutil.which(command)
     if executable is None:
         return None
-    environment = os.environ.copy()
-    if toolchain is not None:
-        environment["RUSTUP_TOOLCHAIN"] = toolchain
     for flag in ("--version", "-V"):
         try:
             return (
-                subprocess.check_output([executable, flag], text=True, env=environment)
+                subprocess.check_output(
+                    [executable, flag], text=True, cwd=checkout, env=environment
+                )
                 .strip()
                 .splitlines()[0]
             )
@@ -353,12 +358,30 @@ def tool_version(command: str, toolchain: str | None = None) -> str | None:
     return None
 
 
+def git_environment() -> dict[str, str]:
+    """Prevent an outer Git invocation from redirecting a checkout command."""
+    environment = os.environ.copy()
+    for name in (
+        "GIT_DIR",
+        "GIT_WORK_TREE",
+        "GIT_INDEX_FILE",
+        "GIT_COMMON_DIR",
+        "GIT_OBJECT_DIRECTORY",
+        "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+        "GIT_PREFIX",
+    ):
+        environment.pop(name, None)
+    return environment
+
+
 def git(*args: str | Path, cwd: Path | None = None) -> None:
     # --quiet goes right after the subcommand, never after a revision, where
     # checkout would read it as a pathspec. A clone per cell would otherwise
     # bury the phase progress this prints between builds.
     subcommand, *rest = [str(arg) for arg in args]
-    subprocess.run(["git", subcommand, "--quiet", *rest], cwd=cwd, check=True)
+    subprocess.run(
+        ["git", subcommand, "--quiet", *rest], cwd=cwd, env=git_environment(), check=True
+    )
 
 
 def clone(subject: dict[str, object], revision: str, destination: Path) -> None:
@@ -371,6 +394,16 @@ def clone(subject: dict[str, object], revision: str, destination: Path) -> None:
     destination.parent.mkdir(parents=True, exist_ok=True)
     git("clone", "--no-checkout", "--shared", str(subject["mirror"]), destination)
     git("checkout", "--detach", revision, cwd=destination)
+
+
+def worktree(source: Path, revision: str, destination: Path) -> None:
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    subprocess.run(
+        ["git", "worktree", "add", "--quiet", "--detach", str(destination), revision],
+        cwd=source,
+        env=git_environment(),
+        check=True,
+    )
 
 
 class Runner:
@@ -386,18 +419,22 @@ class Runner:
         subject: dict[str, object],
         target: Path,
         local: bool = False,
+        default_target: bool = False,
     ) -> dict[str, str]:
         environment = os.environ.copy()
         environment.update(
             {
                 "CARGO_HOME": str(self.cargo_home),
-                "CARGO_TARGET_DIR": str(target),
                 # Off for the CI scenarios, matching what CI sets. The edit
                 # loop turns it on, because a developer's rebuild has it on.
                 "CARGO_INCREMENTAL": "1" if local else "0",
                 "CARGO_TERM_COLOR": "never",
             }
         )
+        if default_target:
+            environment.pop("CARGO_TARGET_DIR", None)
+        else:
+            environment["CARGO_TARGET_DIR"] = str(target)
         if subject.get("toolchain") is not None:
             environment["RUSTUP_TOOLCHAIN"] = str(subject["toolchain"])
         # A wrapper inherited from the caller's shell would silently cache the
@@ -422,11 +459,13 @@ class Runner:
         tool: str,
         cell: str,
         subject: dict[str, object],
+        checkout: Path,
         target: Path,
         store: Path,
         args: list[str] | None = None,
         toolchain: str | None = None,
         local: bool = False,
+        default_target: bool = False,
     ) -> tuple[list[str], dict[str, str]]:
         """The command and environment one cell runs the subject under.
 
@@ -435,13 +474,18 @@ class Runner:
         two shapes could drift and the comparison between them would stop
         meaning anything.
         """
-        environment = self.base_environment(subject, target, local)
+        environment = self.base_environment(subject, target, local, default_target)
         if toolchain is not None:
             environment["RUSTUP_TOOLCHAIN"] = toolchain
+        # A directly invoked Cargo can otherwise find a different rustc via
+        # mise's PATH shim. Resolve both binaries the same way for every row,
+        # including the mbx row it is compared against.
+        environment["RUSTC"] = self.real_rust_tool("rustc", checkout, environment)
         args = list(subject["args"]) if args is None else args  # type: ignore[arg-type]
 
         if tool == "cargo":
-            return ["cargo", *args], environment
+            environment["MBX_DISABLE"] = "1"
+            return [self.real_rust_tool("cargo", checkout, environment), *args], environment
         if tool in MBX_TOOLS:
             if self.mbx is None:
                 raise Skipped("no mbx binary was given (--mbx)")
@@ -463,6 +507,7 @@ class Runner:
                 raise Skipped("kache is not on PATH")
             environment.update(
                 {
+                    "MBX_DISABLE": "1",
                     "RUSTC_WRAPPER": kache,
                     "KACHE_CACHE_DIR": str(store),
                     "KACHE_RUNTIME_DIR": str(store.parent / f"{store.name}-runtime"),
@@ -471,8 +516,47 @@ class Runner:
                     "KACHE_LOCAL_ONLY": "1",
                 }
             )
-            return ["cargo", *args], environment
+            return [self.real_rust_tool("cargo", checkout, environment), *args], environment
         raise ValueError(f"unknown tool {tool}")
+
+    @staticmethod
+    def real_rust_tool(name: str, checkout: Path, environment: dict[str, str]) -> str:
+        # A developer may have installed mbx as a transparent cargo shim on
+        # PATH. The raw Cargo baseline and kache row must bypass that shim.
+        # Prefer rustup in the subject checkout so its toolchain file is
+        # honored. System Rust installations can use their binaries on PATH.
+        if shutil.which("rustup") is not None:
+            return subprocess.check_output(
+                ["rustup", "which", name],
+                cwd=checkout,
+                env=environment,
+                text=True,
+            ).strip()
+        if environment.get("RUSTUP_TOOLCHAIN"):
+            raise Skipped("a requested Rust toolchain requires rustup")
+        resolved = shutil.which(name)
+        if resolved is None:
+            raise Skipped(f"{name} is not on PATH")
+        return resolved
+
+    def stop_kache(self, *, subject: dict[str, object], checkout: Path, store: Path) -> None:
+        """Stop the daemon for this cell before its scratch directory is removed."""
+        environment = self.base_environment(subject, checkout / "target", default_target=True)
+        environment.update(
+            {
+                "KACHE_CACHE_DIR": str(store),
+                "KACHE_RUNTIME_DIR": str(store.parent / f"{store.name}-runtime"),
+                "KACHE_LOCAL_ONLY": "1",
+            }
+        )
+        subprocess.run(
+            [shutil.which("kache") or "kache", "daemon", "stop"],
+            cwd=checkout,
+            env=environment,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
 
     def run(
         self,
@@ -486,6 +570,8 @@ class Runner:
         toolchain: str | None = None,
         local: bool = False,
         fresh_target: bool = True,
+        default_target: bool = False,
+        keep_daemon: bool = False,
     ) -> dict[str, object]:
         """Run one build and return its timing plus whatever the tool reported."""
         # Every scenario but the edit loop starts from a fresh target, as a CI
@@ -497,10 +583,12 @@ class Runner:
             tool=tool,
             cell=cell,
             subject=subject,
+            checkout=checkout,
             target=target,
             store=store,
             toolchain=toolchain,
             local=local,
+            default_target=default_target,
         )
 
         started = time.perf_counter_ns()
@@ -519,6 +607,8 @@ class Runner:
             f"$ {' '.join(command)}\n\n{completed.stdout}\n{completed.stderr}", encoding="utf-8"
         )
         if completed.returncode != 0:
+            if tool == "kache" and not keep_daemon:
+                self.stop_kache(subject=subject, checkout=checkout, store=store)
             raise RuntimeError(f"{cell}/{tool} build failed; see {log}")
 
         if tool in MBX_TOOLS:
@@ -537,18 +627,11 @@ class Runner:
                 capture_output=True,
             )
             extra["summary"] = stats.stdout.strip().splitlines()
-            # Each cell points kache at its own runtime directory, so each one
-            # starts its own daemon. Stopping it keeps the cells independent
-            # and stops a draining daemon from writing into a tree that is
-            # about to be removed.
-            subprocess.run(
-                [shutil.which("kache") or "kache", "daemon", "stop"],
-                cwd=checkout,
-                env=environment,
-                text=True,
-                capture_output=True,
-                check=False,
-            )
+            # Each cell points kache at its own runtime directory. The
+            # worktree seed keeps that daemon running for the timed build;
+            # other calls stop it before their scratch tree is removed.
+            if not keep_daemon:
+                self.stop_kache(subject=subject, checkout=checkout, store=store)
 
         # An edit that invalidated nothing would render as a very fast
         # rebuild, so the gate needs to know whether a compiler ran at all.
@@ -593,6 +676,7 @@ class Runner:
                 tool=tool,
                 cell=f"{cell}-{name}",
                 subject=subject,
+                checkout=checkout,
                 target=target,
                 store=store,
                 args=args,
@@ -766,6 +850,10 @@ def publishable(result: dict[str, object]) -> dict[str, object]:
                 trimmed["stats"] = {
                     field: stats[field] for field in PUBLISHED_STATS if field in stats
                 }
+                if scenario["scenario"] == "worktree":
+                    for field in ("compiler", "wrapper_phases_ns", "bypasses"):
+                        if field in stats:
+                            trimmed["stats"][field] = stats[field]
             cells.append(trimmed)
         scenarios.append({**scenario, "results": cells})
     return {**result, "scenarios": scenarios}
@@ -839,6 +927,39 @@ def one_trial(
         # timing is what the warm gate compares against.
         measured["seed_wall_duration_ns"] = seed["wall_duration_ns"]
         return measured
+
+    if scenario == "worktree":
+        first = work / f"checkout-{cell}-first"
+        second = work / f"checkout-{cell}-second"
+        revision = str(subject["child"])
+        clone(subject, revision, first)
+        try:
+            seed = runner.run(
+                tool=tool,
+                cell=f"{cell}-seed",
+                subject=subject,
+                checkout=first,
+                target=first / "target",
+                store=store,
+                default_target=True,
+                keep_daemon=True,
+            )
+            worktree(first, revision, second)
+            measured = runner.run(
+                tool=tool,
+                cell=cell,
+                subject=subject,
+                checkout=second,
+                target=second / "target",
+                store=store,
+                default_target=True,
+                keep_daemon=True,
+            )
+            measured["seed_wall_duration_ns"] = seed["wall_duration_ns"]
+            return measured
+        finally:
+            if tool == "kache":
+                runner.stop_kache(subject=subject, checkout=first, store=store)
 
     if scenario == "commit":
         checkout = work / f"checkout-{cell}"
@@ -1077,6 +1198,15 @@ def validate(scenarios: list[dict[str, object]]) -> list[str]:
                         f"warm: {cell['tool']} was no faster than the cold build that seeded it"
                     )
 
+    worktree = by_name.get("worktree")
+    if worktree:
+        for cell in worktree["results"]:  # type: ignore[index]
+            for trial in trials_of(cell):
+                if cell["tool"] == "mbx" and not trial.get("stats"):
+                    failures.append(
+                        "worktree: mbx produced no stats, so reuse cannot be assessed"
+                    )
+
     edit = by_name.get("edit")
     if edit:
         # A rebuild that compiled nothing means the edit never reached the
@@ -1188,18 +1318,33 @@ def summarize(result: dict[str, object]) -> str:
             if scenario["skipped"]:
                 lines.append("")
             continue
-        lines += [
-            "| Tool | Median wall time | Trials | Hits | Restored files |",
-            "| :--- | ---: | ---: | ---: | ---: |",
-        ]
+        if scenario["scenario"] == "worktree":
+            lines += [
+                "| Tool | Median wall time | Trials | Hits | Misses | Predictions loaded | Restored files |",
+                "| :--- | ---: | ---: | ---: | ---: | ---: | ---: |",
+            ]
+        else:
+            lines += [
+                "| Tool | Median wall time | Trials | Hits | Restored files |",
+                "| :--- | ---: | ---: | ---: | ---: |",
+            ]
         for cell in scenario["results"]:
             stats = cell.get("stats")
             hit = str(hits(cell)) if isinstance(stats, dict) else "-"
             files = str(restored_files(cell)) if isinstance(stats, dict) else "-"
-            lines.append(
+            row = (
                 f"| {cell['tool']} | {cell['wall_duration_ns'] / 1e9:.1f} s "
-                f"| {trial_range(cell)} | {hit} | {files} |"
+                f"| {trial_range(cell)} | {hit} |"
             )
+            if scenario["scenario"] == "worktree":
+                misses = str(stats.get("misses", 0)) if isinstance(stats, dict) else "-"
+                predictions = (
+                    str(stats.get("predictions_loaded", 0))
+                    if isinstance(stats, dict)
+                    else "-"
+                )
+                row += f" {misses} | {predictions} |"
+            lines.append(f"{row} {files} |")
         lines.append("")
         for note in scenario["skipped"]:
             lines.append(f"- skipped {note}")
@@ -1216,7 +1361,7 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--subject", default="aube", choices=sorted(SUBJECTS))
     parser.add_argument("--tools", default=",".join(TOOLS))
-    parser.add_argument("--scenarios", default="warm,commit,edit")
+    parser.add_argument("--scenarios", default="warm,worktree,commit,edit")
     parser.add_argument(
         "--trials",
         type=int,
@@ -1291,26 +1436,28 @@ def main() -> int:
         # timed while it downloads crates.
         seed = work / "fetch"
         clone(subject, str(subject["child"]), seed)
+        runner = Runner(output, cargo_home, mbx)
+        version_environment = runner.base_environment(subject, seed / "target")
+        cargo_executable = runner.real_rust_tool("cargo", seed, version_environment)
+        rustc_executable = runner.real_rust_tool("rustc", seed, version_environment)
+        version_environment["RUSTC"] = rustc_executable
+        cargo_version = tool_version(
+            cargo_executable, checkout=seed, environment=version_environment
+        )
+        rustc_version = tool_version(
+            rustc_executable, checkout=seed, environment=version_environment
+        )
         subprocess.run(
-            ["cargo", "fetch", "--locked"],
+            [cargo_executable, "fetch", "--locked"],
             cwd=seed,
             check=True,
-            env={
-                **os.environ,
-                "CARGO_HOME": str(cargo_home),
-                **(
-                    {"RUSTUP_TOOLCHAIN": str(subject["toolchain"])}
-                    if subject.get("toolchain") is not None
-                    else {}
-                ),
-            },
+            env=version_environment,
         )
 
         # Described while the scratch tree still exists, since that is the
         # filesystem every timed build ran on.
         filesystem_described = filesystem(work)
 
-        runner = Runner(output, cargo_home, mbx)
         scenarios = []
         for name, tools in plan:
             scenarios.append(
@@ -1318,10 +1465,6 @@ def main() -> int:
             )
 
     failures = validate(scenarios)
-    pin = subject.get("toolchain")
-    pin = None if pin is None else str(pin)
-    cargo_version = tool_version("cargo", pin)
-    rustc_version = tool_version("rustc", pin)
     result: dict[str, object] = {
         # 2 added per-trial timings and named the published timing a median.
         "schema": 2,
