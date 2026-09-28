@@ -36,10 +36,8 @@ fn compiler_identity_hashes_sysroot_codegen_backends() {
         .join("lib/rustlib/aarch64-apple-darwin/codegen-backends");
     std::fs::create_dir_all(backends.parent().unwrap()).unwrap();
 
-    let directories = codegen_backend_directories(rustc.as_os_str());
-    assert_eq!(directories, vec![backends.clone()]);
-    assert!(codegen_backend_digests(&directories).unwrap().is_empty());
-    let absent = codegen_backend_pins(&directories);
+    let (absent, identity) = codegen_backends(rustc.as_os_str()).unwrap();
+    assert!(identity.is_empty());
     assert_eq!(absent.len(), 1);
     assert!(absent[0].state.is_none());
 
@@ -47,22 +45,17 @@ fn compiler_identity_hashes_sysroot_codegen_backends() {
     let library = backends.join("librustc_codegen_cranelift-1.99.0-nightly.dylib");
     std::fs::write(&library, "backend one").unwrap();
     assert!(!absent[0].holds());
-    let first = codegen_backend_digests(&directories).unwrap();
-    assert_eq!(
-        first
-            .iter()
-            .map(|(name, _)| name.as_str())
-            .collect::<Vec<_>>(),
-        vec!["librustc_codegen_cranelift-1.99.0-nightly.dylib"]
+    let (pins, first) = codegen_backends(rustc.as_os_str()).unwrap();
+    assert!(
+        first.contains("mbx-codegen-backend: librustc_codegen_cranelift-1.99.0-nightly.dylib ")
     );
-    let pins = codegen_backend_pins(&directories);
     assert_eq!(
         pins.iter().map(|pin| pin.path.clone()).collect::<Vec<_>>(),
         vec![backends, library.clone()]
     );
 
     std::fs::write(&library, "backend two").unwrap();
-    assert_ne!(codegen_backend_digests(&directories).unwrap(), first);
+    assert_ne!(codegen_backends(rustc.as_os_str()).unwrap().1, first);
     assert!(!pins[1].holds());
 }
 

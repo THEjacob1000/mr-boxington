@@ -1545,23 +1545,17 @@ fn models_parallel_frontend_options_in_the_action_key() {
             Err(BypassReason::UnknownFlag(format!("-Z{path}")))
         );
     }
-    let with_sysroot = |backend: &str| {
+    assert_eq!(
         RustcInvocation::parse(&args(&[
             "--crate-name=widget",
             "--crate-type=lib",
             "--emit=dep-info,metadata,link",
-            &format!("-Zcodegen-backend={backend}"),
+            "-Zcodegen-backend=llvm",
             "--sysroot=/opt/sysroot",
             "src/lib.rs",
-        ]))
-    };
-    assert_eq!(
-        with_sysroot("cranelift"),
-        Err(BypassReason::UnknownFlag(
-            "-Zcodegen-backend=cranelift".into()
-        ))
+        ])),
+        Err(BypassReason::UnknownFlag("-Zcodegen-backend=llvm".into()))
     );
-    assert!(with_sysroot("llvm").is_ok());
 
     let jobs_frontend = invocation(&["-Zunstable-options", "--jobs-frontend=16"]);
     assert_ne!(key(separate), key(jobs_frontend));

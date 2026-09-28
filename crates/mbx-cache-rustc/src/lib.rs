@@ -1547,9 +1547,7 @@ impl<'a> Parser<'a> {
                 && !backend.is_empty()
                 && !backend.contains(['.', '/', '\\'])
             {
-                if backend != "llvm" {
-                    self.sysroot_backend = Some(format!("-Z{option}"));
-                }
+                self.sysroot_backend = Some(format!("-Z{option}"));
                 self.parsed.push(Argument::Plain(format!("-Z{option}")));
                 return Ok(());
             }

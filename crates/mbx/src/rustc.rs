@@ -2822,10 +2822,10 @@ fn query_compiler_identity(rustc: &OsStr) -> Result<CompilerIdentity> {
         // Described before the compiler runs, so a binary replaced while it
         // prints its version is never recorded under the replacement.
         let mut pins = compiler_identity_pins(&executable);
-        let backends = codegen_backend_directories(rustc);
+        let (backend_pins, backends) = codegen_backends(rustc)?;
         // An unpinned compiler is probed every session, so it stays unpinned.
         if !pins.is_empty() {
-            pins.extend(codegen_backend_pins(&backends));
+            pins.extend(backend_pins);
         }
         let mut command = Command::new(&executable);
         command.arg("-vV");
@@ -2867,10 +2867,7 @@ fn query_compiler_identity(rustc: &OsStr) -> Result<CompilerIdentity> {
             stdout.extend_from_slice(output.stdout.trim_ascii());
             stdout.push(b'\n');
         }
-        for (name, digest) in codegen_backend_digests(&backends)? {
-            stdout
-                .extend_from_slice(format!("\nmbx-codegen-backend: {name} {digest}\n").as_bytes());
-        }
+        stdout.extend_from_slice(backends.as_bytes());
         let responses = session::request_agent(&[AgentRequest::StoreExecutableIdentity {
             executable,
             environment,
@@ -2941,12 +2938,15 @@ fn compiler_identity_pins(executable: &Path) -> Vec<PinnedFile> {
     }
 }
 
-fn codegen_backend_directories(rustc: &OsStr) -> Vec<PathBuf> {
-    let Some(sysroot) = compiler_sysroot(rustc) else {
-        return Vec::new();
-    };
-    let Ok(targets) = std::fs::read_dir(sysroot.join("lib/rustlib")) else {
-        return Vec::new();
+/// The backend libraries rustc loads by name from its sysroot, each pinned
+/// before it is hashed into the identity.
+fn codegen_backends(rustc: &OsStr) -> Result<(Vec<PinnedFile>, String)> {
+    let mut pins = Vec::new();
+    let mut identity = String::new();
+    let Some(targets) = compiler_sysroot(rustc)
+        .and_then(|sysroot| std::fs::read_dir(sysroot.join("lib/rustlib")).ok())
+    else {
+        return Ok((pins, identity));
     };
     let mut directories = targets
         .flatten()
@@ -2954,45 +2954,29 @@ fn codegen_backend_directories(rustc: &OsStr) -> Vec<PathBuf> {
         .map(|entry| entry.path().join("codegen-backends"))
         .collect::<Vec<_>>();
     directories.sort();
-    directories
-}
-
-fn codegen_backend_pins(directories: &[PathBuf]) -> Vec<PinnedFile> {
-    let mut pins = Vec::new();
     for directory in directories {
         pins.extend(PinnedFile::describe(directory.clone()));
-        let Ok(entries) = std::fs::read_dir(directory) else {
+        let Ok(entries) = std::fs::read_dir(&directory) else {
             continue;
         };
-        pins.extend(
-            entries
-                .flatten()
-                .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_file()))
-                .filter_map(|entry| PinnedFile::describe(entry.path())),
-        );
-    }
-    pins
-}
-
-fn codegen_backend_digests(directories: &[PathBuf]) -> Result<Vec<(String, String)>> {
-    let mut digests = Vec::new();
-    for directory in directories {
-        let Ok(entries) = std::fs::read_dir(directory) else {
-            continue;
-        };
-        for entry in entries.flatten() {
-            if !entry.file_type().is_ok_and(|kind| kind.is_file()) {
-                continue;
-            }
-            let digest = CacheDigest::blake3_file(&entry.path())?;
-            digests.push((
-                entry.file_name().to_string_lossy().into_owned(),
-                digest.hash,
-            ));
+        let mut files = entries
+            .flatten()
+            .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_file()))
+            .collect::<Vec<_>>();
+        files.sort_by_key(std::fs::DirEntry::path);
+        for file in files {
+            let path = file.path();
+            pins.extend(PinnedFile::describe(path.clone()));
+            let digest = CacheDigest::blake3_file(&path)?;
+            let name = file.file_name();
+            identity += &format!(
+                "\nmbx-codegen-backend: {} {}\n",
+                name.display(),
+                digest.hash
+            );
         }
     }
-    digests.sort();
-    Ok(digests)
+    Ok((pins, identity))
 }
 
 /// The `rustc_driver` library a toolchain installs beside its compiler:
