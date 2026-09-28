@@ -57,7 +57,8 @@ fn compiler_identity_hashes_sysroot_codegen_backends() {
         vec![backends.clone(), library.clone()]
     );
 
-    std::fs::write(&library, "backend two").unwrap();
+    // A new length: Windows can keep the write time of an immediate rewrite.
+    std::fs::write(&library, "backend 2").unwrap();
     assert_ne!(probe().1, first);
     assert!(!pins[1].holds());
 
