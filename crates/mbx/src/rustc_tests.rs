@@ -33,32 +33,33 @@ fn compiler_identity_hashes_sysroot_codegen_backends() {
     std::fs::write(&rustc, "compiler").unwrap();
     let rustlib = directory.path().join("lib/rustlib");
     let backends = rustlib.join("aarch64-apple-darwin/codegen-backends");
-    std::fs::create_dir_all(&rustlib).unwrap();
-    let (bare, _) = codegen_backends(rustc.as_os_str()).unwrap();
-    std::fs::create_dir_all(backends.parent().unwrap()).unwrap();
-    assert!(!bare[0].holds());
+    // Another target's backends are never loaded, so they stay out.
+    let other = rustlib.join("x86_64-pc-windows-msvc/codegen-backends");
+    std::fs::create_dir_all(&other).unwrap();
+    std::fs::write(other.join("librustc_codegen_other.dll"), "unused").unwrap();
+    let probe = || codegen_backends(rustc.as_os_str(), "aarch64-apple-darwin").unwrap();
 
-    let (absent, identity) = codegen_backends(rustc.as_os_str()).unwrap();
+    let (absent, identity) = probe();
     assert!(identity.is_empty());
-    assert_eq!(absent.len(), 2);
-    assert!(absent[1].state.is_none());
+    assert_eq!(absent.len(), 1);
+    assert!(absent[0].state.is_none());
 
     std::fs::create_dir_all(&backends).unwrap();
     let library = backends.join("librustc_codegen_cranelift-1.99.0-nightly.dylib");
     std::fs::write(&library, "backend one").unwrap();
-    assert!(!absent[1].holds());
-    let (pins, first) = codegen_backends(rustc.as_os_str()).unwrap();
+    assert!(!absent[0].holds());
+    let (pins, first) = probe();
     assert!(
         first.contains("mbx-codegen-backend: librustc_codegen_cranelift-1.99.0-nightly.dylib ")
     );
     assert_eq!(
         pins.iter().map(|pin| pin.path.clone()).collect::<Vec<_>>(),
-        vec![rustlib, backends.clone(), library.clone()]
+        vec![backends.clone(), library.clone()]
     );
 
     std::fs::write(&library, "backend two").unwrap();
-    assert_ne!(codegen_backends(rustc.as_os_str()).unwrap().1, first);
-    assert!(!pins[2].holds());
+    assert_ne!(probe().1, first);
+    assert!(!pins[1].holds());
 
     #[cfg(unix)]
     {
@@ -67,7 +68,7 @@ fn compiler_identity_hashes_sysroot_codegen_backends() {
         std::fs::write(&store, "linked backend").unwrap();
         std::os::unix::fs::symlink(&store, backends.join("librustc_codegen_gcc.so")).unwrap();
         std::os::unix::fs::symlink("missing", backends.join("librustc_codegen_gone.so")).unwrap();
-        let (_, linked) = codegen_backends(rustc.as_os_str()).unwrap();
+        let (_, linked) = probe();
         assert!(linked.contains("mbx-codegen-backend: librustc_codegen_gcc.so "));
         assert!(!linked.contains("librustc_codegen_gone.so"));
     }

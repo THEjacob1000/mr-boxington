@@ -2822,11 +2822,6 @@ fn query_compiler_identity(rustc: &OsStr) -> Result<CompilerIdentity> {
         // Described before the compiler runs, so a binary replaced while it
         // prints its version is never recorded under the replacement.
         let mut pins = compiler_identity_pins(&executable);
-        let (backend_pins, backends) = codegen_backends(rustc)?;
-        // An unpinned compiler is probed every session, so it stays unpinned.
-        if !pins.is_empty() {
-            pins.extend(backend_pins);
-        }
         let mut command = Command::new(&executable);
         command.arg("-vV");
         for (name, value) in &environment {
@@ -2845,6 +2840,7 @@ fn query_compiler_identity(rustc: &OsStr) -> Result<CompilerIdentity> {
             );
         }
         let mut stdout = output.stdout;
+        let host = identity_field(&String::from_utf8_lossy(&stdout), "host")?.to_string();
         if clippy {
             let mut command = Command::new(&executable);
             command.arg("--version");
@@ -2866,6 +2862,11 @@ fn query_compiler_identity(rustc: &OsStr) -> Result<CompilerIdentity> {
             stdout.extend_from_slice(b"\nmbx-driver: ");
             stdout.extend_from_slice(output.stdout.trim_ascii());
             stdout.push(b'\n');
+        }
+        let (backend_pins, backends) = codegen_backends(rustc, &host)?;
+        // An unpinned compiler is probed every session, so it stays unpinned.
+        if !pins.is_empty() {
+            pins.extend(backend_pins);
         }
         stdout.extend_from_slice(backends.as_bytes());
         let responses = session::request_agent(&[AgentRequest::StoreExecutableIdentity {
@@ -2938,35 +2939,31 @@ fn compiler_identity_pins(executable: &Path) -> Vec<PinnedFile> {
     }
 }
 
-/// The backend libraries rustc loads by name from its sysroot, each pinned
-/// before it is hashed into the identity.
-fn codegen_backends(rustc: &OsStr) -> Result<(Vec<PinnedFile>, String)> {
+/// The backend libraries rustc loads by name from its host's directory in
+/// its sysroot, each pinned before it is hashed into the identity.
+fn codegen_backends(rustc: &OsStr, host: &str) -> Result<(Vec<PinnedFile>, String)> {
     let mut pins = Vec::new();
     let mut identity = String::new();
     let Some(sysroot) = compiler_sysroot(rustc) else {
         return Ok((pins, identity));
     };
-    let rustlib = sysroot.join("lib/rustlib");
-    pins.extend(PinnedFile::describe(rustlib.clone()));
-    for (target, metadata) in resolved_entries(&rustlib)? {
-        if !metadata.is_dir() {
+    let directory = sysroot
+        .join("lib/rustlib")
+        .join(host)
+        .join("codegen-backends");
+    pins.extend(PinnedFile::describe(directory.clone()));
+    for (path, metadata) in resolved_entries(&directory)? {
+        if !metadata.is_file() {
             continue;
         }
-        let directory = target.join("codegen-backends");
-        pins.extend(PinnedFile::describe(directory.clone()));
-        for (path, metadata) in resolved_entries(&directory)? {
-            if !metadata.is_file() {
-                continue;
-            }
-            pins.extend(PinnedFile::describe(path.clone()));
-            let digest = CacheDigest::blake3_file(&path)?;
-            let name = path.file_name().unwrap_or_default();
-            identity += &format!(
-                "\nmbx-codegen-backend: {} {}\n",
-                name.display(),
-                digest.hash
-            );
-        }
+        pins.extend(PinnedFile::describe(path.clone()));
+        let digest = CacheDigest::blake3_file(&path)?;
+        let name = path.file_name().unwrap_or_default();
+        identity += &format!(
+            "\nmbx-codegen-backend: {} {}\n",
+            name.display(),
+            digest.hash
+        );
     }
     Ok((pins, identity))
 }
