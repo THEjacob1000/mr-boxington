@@ -2943,32 +2943,24 @@ fn compiler_identity_pins(executable: &Path) -> Vec<PinnedFile> {
 fn codegen_backends(rustc: &OsStr) -> Result<(Vec<PinnedFile>, String)> {
     let mut pins = Vec::new();
     let mut identity = String::new();
-    let Some(targets) = compiler_sysroot(rustc)
-        .and_then(|sysroot| std::fs::read_dir(sysroot.join("lib/rustlib")).ok())
-    else {
+    let Some(sysroot) = compiler_sysroot(rustc) else {
         return Ok((pins, identity));
     };
-    let mut directories = targets
-        .flatten()
-        .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_dir()))
-        .map(|entry| entry.path().join("codegen-backends"))
-        .collect::<Vec<_>>();
-    directories.sort();
-    for directory in directories {
-        pins.extend(PinnedFile::describe(directory.clone()));
-        let Ok(entries) = std::fs::read_dir(&directory) else {
+    let rustlib = sysroot.join("lib/rustlib");
+    pins.extend(PinnedFile::describe(rustlib.clone()));
+    for (target, metadata) in resolved_entries(&rustlib)? {
+        if !metadata.is_dir() {
             continue;
-        };
-        let mut files = entries
-            .flatten()
-            .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_file()))
-            .collect::<Vec<_>>();
-        files.sort_by_key(std::fs::DirEntry::path);
-        for file in files {
-            let path = file.path();
+        }
+        let directory = target.join("codegen-backends");
+        pins.extend(PinnedFile::describe(directory.clone()));
+        for (path, metadata) in resolved_entries(&directory)? {
+            if !metadata.is_file() {
+                continue;
+            }
             pins.extend(PinnedFile::describe(path.clone()));
             let digest = CacheDigest::blake3_file(&path)?;
-            let name = file.file_name();
+            let name = path.file_name().unwrap_or_default();
             identity += &format!(
                 "\nmbx-codegen-backend: {} {}\n",
                 name.display(),
@@ -2977,6 +2969,26 @@ fn codegen_backends(rustc: &OsStr) -> Result<(Vec<PinnedFile>, String)> {
         }
     }
     Ok((pins, identity))
+}
+
+/// The entries of `directory` sorted by path, with symlinks followed. An
+/// absent directory or a dangling link contributes nothing; any other failure
+/// is an error, so an incomplete listing never becomes an identity.
+fn resolved_entries(directory: &Path) -> Result<Vec<(PathBuf, std::fs::Metadata)>> {
+    let entries = match std::fs::read_dir(directory) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        entries => entries?,
+    };
+    let mut resolved = Vec::new();
+    for entry in entries {
+        let path = entry?.path();
+        match std::fs::metadata(&path) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            metadata => resolved.push((path, metadata?)),
+        }
+    }
+    resolved.sort_by(|(left, _), (right, _)| left.cmp(right));
+    Ok(resolved)
 }
 
 /// The `rustc_driver` library a toolchain installs beside its compiler:
