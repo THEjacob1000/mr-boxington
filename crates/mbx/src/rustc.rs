@@ -2959,11 +2959,7 @@ fn codegen_backends(rustc: &OsStr, host: &str) -> Result<(Vec<PinnedFile>, Strin
         pins.extend(PinnedFile::describe(path.clone()));
         let digest = CacheDigest::blake3_file(&path)?;
         let name = path.file_name().unwrap_or_default();
-        identity += &format!(
-            "\nmbx-codegen-backend: {} {}\n",
-            name.display(),
-            digest.hash
-        );
+        identity += &format!("\nmbx-codegen-backend: {:?} {}\n", name, digest.hash);
     }
     Ok((pins, identity))
 }

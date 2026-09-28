@@ -50,7 +50,7 @@ fn compiler_identity_hashes_sysroot_codegen_backends() {
     assert!(!absent[0].holds());
     let (pins, first) = probe();
     assert!(
-        first.contains("mbx-codegen-backend: librustc_codegen_cranelift-1.99.0-nightly.dylib ")
+        first.contains("mbx-codegen-backend: \"librustc_codegen_cranelift-1.99.0-nightly.dylib\" ")
     );
     assert_eq!(
         pins.iter().map(|pin| pin.path.clone()).collect::<Vec<_>>(),
@@ -70,7 +70,7 @@ fn compiler_identity_hashes_sysroot_codegen_backends() {
         std::os::unix::fs::symlink(&store, backends.join("librustc_codegen_gcc.so")).unwrap();
         std::os::unix::fs::symlink("missing", backends.join("librustc_codegen_gone.so")).unwrap();
         let (_, linked) = probe();
-        assert!(linked.contains("mbx-codegen-backend: librustc_codegen_gcc.so "));
+        assert!(linked.contains("mbx-codegen-backend: \"librustc_codegen_gcc.so\" "));
         assert!(!linked.contains("librustc_codegen_gone.so"));
     }
 }
