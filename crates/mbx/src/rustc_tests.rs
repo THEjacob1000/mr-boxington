@@ -24,6 +24,48 @@ fn compiler_pins_name_a_toolchain_rustc_and_nothing_else() {
     assert!(pins.iter().all(|pin| pin.state.is_some()));
 }
 
+#[test]
+fn compiler_identity_hashes_sysroot_codegen_backends() {
+    let directory = tempfile::tempdir().unwrap();
+    let bin = directory.path().join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    let rustc = bin.join("rustc");
+    std::fs::write(&rustc, "compiler").unwrap();
+    let backends = directory
+        .path()
+        .join("lib/rustlib/aarch64-apple-darwin/codegen-backends");
+    std::fs::create_dir_all(backends.parent().unwrap()).unwrap();
+
+    let directories = codegen_backend_directories(rustc.as_os_str());
+    assert_eq!(directories, vec![backends.clone()]);
+    assert!(codegen_backend_digests(&directories).unwrap().is_empty());
+    let absent = codegen_backend_pins(&directories);
+    assert_eq!(absent.len(), 1);
+    assert!(absent[0].state.is_none());
+
+    std::fs::create_dir_all(&backends).unwrap();
+    let library = backends.join("librustc_codegen_cranelift-1.99.0-nightly.dylib");
+    std::fs::write(&library, "backend one").unwrap();
+    assert!(!absent[0].holds());
+    let first = codegen_backend_digests(&directories).unwrap();
+    assert_eq!(
+        first
+            .iter()
+            .map(|(name, _)| name.as_str())
+            .collect::<Vec<_>>(),
+        vec!["librustc_codegen_cranelift-1.99.0-nightly.dylib"]
+    );
+    let pins = codegen_backend_pins(&directories);
+    assert_eq!(
+        pins.iter().map(|pin| pin.path.clone()).collect::<Vec<_>>(),
+        vec![backends, library.clone()]
+    );
+
+    std::fs::write(&library, "backend two").unwrap();
+    assert_ne!(codegen_backend_digests(&directories).unwrap(), first);
+    assert!(!pins[1].holds());
+}
+
 /// `RUSTC_BOOTSTRAP` enters the key only when set, so builds that never set
 /// it keep their existing keys.
 #[test]
