@@ -217,7 +217,7 @@ mbx narrows the configured mode to what the environment allows:
 
 | Context | Effective behavior |
 | --- | --- |
-| Push to a protected branch (not a tag) on GitHub Actions or GitLab CI, or to the pipeline's default branch on Buildkite | Configured mode |
+| Push to a protected branch (not a tag) on GitHub Actions or GitLab CI, or a GitHub push to the pipeline's default branch on Buildkite | Configured mode |
 | Anything else: pull or merge requests, merge queue runs, tag pushes and `release` events, scheduled or manually dispatched runs, unprotected or non-default branches, other CI systems, and local shells | Read-only; `write-only` becomes disabled |
 
 Only the triggering event counts, not what the job does. A release job that
@@ -231,7 +231,7 @@ mbx reads the trigger from the CI system's own variables:
 | --- | --- | --- |
 | GitHub Actions | `GITHUB_ACTIONS` | `GITHUB_EVENT_NAME` is `push`, `GITHUB_REF_TYPE` is `branch`, and `GITHUB_REF_PROTECTED` is true |
 | GitLab CI | `GITLAB_CI` | `CI_PIPELINE_SOURCE` is `push`, `CI_COMMIT_REF_PROTECTED` is true, and neither `CI_COMMIT_TAG` nor `CI_MERGE_REQUEST_IID` is set |
-| Buildkite | `BUILDKITE` | `BUILDKITE_SOURCE` is `webhook`, `BUILDKITE_PULL_REQUEST` is `false`, `BUILDKITE_TAG` is unset, and `BUILDKITE_BRANCH` equals `BUILDKITE_PIPELINE_DEFAULT_BRANCH` |
+| Buildkite | `BUILDKITE` | `BUILDKITE_SOURCE` is `webhook`, `BUILDKITE_GITHUB_EVENT` is `push`, `BUILDKITE_PULL_REQUEST` is `false`, `BUILDKITE_TAG` is unset, and `BUILDKITE_BRANCH` equals `BUILDKITE_PIPELINE_DEFAULT_BRANCH` |
 
 This policy prevents untrusted code from publishing objects that later builds
 would trust. The server should still authenticate and authorize requests; the

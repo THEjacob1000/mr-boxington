@@ -336,7 +336,7 @@ Has no effect when `display` is `plain`.
 
 Remote access mode.
 
-Only trusted CI (a push to a protected branch on GitHub Actions or GitLab CI, or to the pipeline's default branch on Buildkite) may write. Everywhere else, including a local shell, `read-write` acts as `read-only` and `write-only` disables the remote.
+Only trusted CI (a push to a protected branch on GitHub Actions or GitLab CI, or a GitHub push to the pipeline's default branch on Buildkite) may write. Everywhere else, including a local shell, `read-write` acts as `read-only` and `write-only` disables the remote.
 
 **Choices:**
 - `read-write`

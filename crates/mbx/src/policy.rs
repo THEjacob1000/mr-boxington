@@ -78,6 +78,7 @@ fn trusted_cache_writer(get_env: &impl Fn(&str) -> Option<String>) -> bool {
         // Buildkite has no protected-branch flag, so the pipeline's default branch stands in for it.
         let branch = get_env("BUILDKITE_BRANCH").filter(|branch| !branch.is_empty());
         return get_env("BUILDKITE_SOURCE").as_deref() == Some("webhook")
+            && get_env("BUILDKITE_GITHUB_EVENT").as_deref() == Some("push")
             && get_env("BUILDKITE_PULL_REQUEST").as_deref() == Some("false")
             && get_env("BUILDKITE_TAG").is_none_or(|tag| tag.is_empty())
             && branch.is_some()
@@ -188,6 +189,7 @@ mod tests {
         let push = [
             ("BUILDKITE", "true"),
             ("BUILDKITE_SOURCE", "webhook"),
+            ("BUILDKITE_GITHUB_EVENT", "push"),
             ("BUILDKITE_PULL_REQUEST", "false"),
             ("BUILDKITE_BRANCH", "main"),
             ("BUILDKITE_PIPELINE_DEFAULT_BRANCH", "main"),
@@ -197,20 +199,40 @@ mod tests {
             Some(RemoteCacheMode::ReadWrite)
         );
 
-        for (name, value) in [
-            ("BUILDKITE_PULL_REQUEST", "42"),
-            ("BUILDKITE_SOURCE", "schedule"),
-            ("BUILDKITE_SOURCE", "ui"),
-            ("BUILDKITE_BRANCH", "feature"),
-            ("BUILDKITE_TAG", "v1.0.0"),
+        // `None` removes the variable.
+        for overrides in [
+            &[("BUILDKITE_PULL_REQUEST", Some("42"))][..],
+            &[("BUILDKITE_PULL_REQUEST", None)],
+            &[("BUILDKITE_SOURCE", Some("schedule"))],
+            &[("BUILDKITE_SOURCE", Some("ui"))],
+            &[("BUILDKITE_SOURCE", None)],
+            &[("BUILDKITE_GITHUB_EVENT", Some("issue_comment"))],
+            &[("BUILDKITE_GITHUB_EVENT", None)],
+            &[("BUILDKITE_BRANCH", Some("feature"))],
+            &[("BUILDKITE_TAG", Some("v1.0.0"))],
+            &[
+                ("BUILDKITE_BRANCH", None),
+                ("BUILDKITE_PIPELINE_DEFAULT_BRANCH", None),
+            ],
+            &[
+                ("BUILDKITE_BRANCH", Some("")),
+                ("BUILDKITE_PIPELINE_DEFAULT_BRANCH", Some("")),
+            ],
         ] {
-            let mut untrusted = push.to_vec();
-            untrusted.retain(|(key, _)| *key != name);
-            untrusted.push((name, value));
+            let mut untrusted: Vec<(&str, &str)> = push
+                .iter()
+                .copied()
+                .filter(|(key, _)| overrides.iter().all(|(name, _)| name != key))
+                .collect();
+            untrusted.extend(
+                overrides
+                    .iter()
+                    .filter_map(|(name, value)| Some((*name, (*value)?))),
+            );
             assert_eq!(
                 effective_remote_cache_mode_with(RemoteCacheMode::ReadWrite, env(&untrusted)),
                 Some(RemoteCacheMode::ReadOnly),
-                "{name}={value}"
+                "{overrides:?}"
             );
         }
     }
