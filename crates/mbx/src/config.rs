@@ -507,8 +507,9 @@ struct RawRemote {
     /// Remote access mode.
     ///
     /// Only trusted CI (a push to a protected branch on GitHub Actions or GitLab
-    /// CI) may write. Everywhere else, including a local shell, `read-write`
-    /// acts as `read-only` and `write-only` disables the remote.
+    /// CI, or to the pipeline's default branch on Buildkite) may write.
+    /// Everywhere else, including a local shell, `read-write` acts as
+    /// `read-only` and `write-only` disables the remote.
     #[usage(
         env = "MBX_REMOTE_MODE",
         default = "read-write",

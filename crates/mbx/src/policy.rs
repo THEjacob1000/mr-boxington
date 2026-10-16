@@ -74,6 +74,15 @@ fn trusted_cache_writer(get_env: &impl Fn(&str) -> Option<String>) -> bool {
             && get_env("CI_MERGE_REQUEST_IID").is_none()
             && env_truthy(get_env("CI_COMMIT_REF_PROTECTED"));
     }
+    if env_truthy(get_env("BUILDKITE")) {
+        // Buildkite has no protected-branch flag, so the pipeline's default branch stands in for it.
+        let branch = get_env("BUILDKITE_BRANCH").filter(|branch| !branch.is_empty());
+        return get_env("BUILDKITE_SOURCE").as_deref() == Some("webhook")
+            && get_env("BUILDKITE_PULL_REQUEST").as_deref() == Some("false")
+            && get_env("BUILDKITE_TAG").is_none_or(|tag| tag.is_empty())
+            && branch.is_some()
+            && branch == get_env("BUILDKITE_PIPELINE_DEFAULT_BRANCH");
+    }
     false
 }
 
@@ -172,6 +181,38 @@ mod tests {
             effective_remote_cache_mode_with(RemoteCacheMode::ReadWrite, &tag),
             Some(RemoteCacheMode::ReadOnly)
         );
+    }
+
+    #[test]
+    fn buildkite_default_branch_pushes_may_write() {
+        let push = [
+            ("BUILDKITE", "true"),
+            ("BUILDKITE_SOURCE", "webhook"),
+            ("BUILDKITE_PULL_REQUEST", "false"),
+            ("BUILDKITE_BRANCH", "main"),
+            ("BUILDKITE_PIPELINE_DEFAULT_BRANCH", "main"),
+        ];
+        assert_eq!(
+            effective_remote_cache_mode_with(RemoteCacheMode::ReadWrite, env(&push)),
+            Some(RemoteCacheMode::ReadWrite)
+        );
+
+        for (name, value) in [
+            ("BUILDKITE_PULL_REQUEST", "42"),
+            ("BUILDKITE_SOURCE", "schedule"),
+            ("BUILDKITE_SOURCE", "ui"),
+            ("BUILDKITE_BRANCH", "feature"),
+            ("BUILDKITE_TAG", "v1.0.0"),
+        ] {
+            let mut untrusted = push.to_vec();
+            untrusted.retain(|(key, _)| *key != name);
+            untrusted.push((name, value));
+            assert_eq!(
+                effective_remote_cache_mode_with(RemoteCacheMode::ReadWrite, env(&untrusted)),
+                Some(RemoteCacheMode::ReadOnly),
+                "{name}={value}"
+            );
+        }
     }
 
     #[test]
